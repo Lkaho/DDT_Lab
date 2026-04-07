@@ -28,6 +28,12 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--load-optimizer",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="When resuming, whether to also restore optimizer state.",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -73,6 +79,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 """Rest everything follows."""
 
 import os
+import re
 from datetime import datetime
 
 import ddt_lab.tasks  # noqa: F401
@@ -80,6 +87,7 @@ import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
 import omni
 import torch
+from ddt_lab.tasks.manager_based.locomotion.agents.rsl_rl_estimator import register_rsl_rl_estimator_extensions
 from isaaclab.envs import (
     DirectMARLEnv,
     DirectMARLEnvCfg,
@@ -94,10 +102,24 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
+register_rsl_rl_estimator_extensions()
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _resolve_checkpoint_iteration(runner: OnPolicyRunner | DistillationRunner, resume_path: str) -> int | None:
+    current_iteration = getattr(runner, "current_learning_iteration", None)
+    if isinstance(current_iteration, int):
+        return current_iteration
+
+    match = re.search(r"model_(\d+)\.pt$", os.path.basename(resume_path))
+    if match is not None:
+        return int(match.group(1))
+
+    return None
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -181,6 +203,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
+    joint_pos_term = None
+    if "joint_pos" in env.unwrapped.action_manager.active_terms:
+        joint_pos_term = env.unwrapped.action_manager.get_term("joint_pos")
+
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
@@ -194,7 +220,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path)
+        runner.load(resume_path, load_optimizer=args_cli.load_optimizer)
+        checkpoint_iteration = _resolve_checkpoint_iteration(runner, resume_path)
+        if joint_pos_term is not None and checkpoint_iteration is not None:
+            steps_per_iteration = max(1, int(getattr(joint_pos_term, "_k_ff_steps_per_iteration", 1)))
+            env.unwrapped.common_step_counter = checkpoint_iteration * steps_per_iteration
+            if hasattr(joint_pos_term, "_update_k_ff_schedule"):
+                joint_pos_term._update_k_ff_schedule()
+            if hasattr(joint_pos_term, "k_ff"):
+                print(
+                    "[INFO] Resume mode: initialized joint_pos k_ff from checkpoint "
+                    f"iteration {checkpoint_iteration} -> k_ff={joint_pos_term.k_ff:.4f}."
+                )
+        elif joint_pos_term is not None:
+            print("[INFO] Resume mode: could not resolve checkpoint iteration, keeping joint_pos k_ff as configured.")
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

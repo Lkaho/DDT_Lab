@@ -300,7 +300,7 @@ class RewardsCfg:
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     joint_mirror = RewTerm(
         func=mdp.joint_mirror,
-        weight=-1.0,
+        weight=-0.05,
         params={"asset_cfg": SceneEntityCfg("robot"), "mirror_joints": [["joint_left_leg_(1|2|3)", "joint_right_leg_(1|2|3)"]]},
     )
     stand_still = RewTerm(
@@ -310,8 +310,8 @@ class RewardsCfg:
     )
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-1.0,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_3"]), "threshold": 1.0},
+        weight=-10.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_2", ".*_leg_3"]), "threshold": 1.0},
     )
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
     base_height_l2 = RewTerm(func=mdp.base_height_l2, weight=-10.0, params={"target_height": 0.3})

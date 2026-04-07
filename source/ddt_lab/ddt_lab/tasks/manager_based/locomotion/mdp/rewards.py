@@ -50,6 +50,29 @@ def track_ang_vel_z_exp(
     return reward
 
 
+def track_heading_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Reward tracking of heading targets using an exponential kernel on heading error."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    zeros = torch.zeros(env.num_envs, device=asset.data.heading_w.device)
+    if command_name not in env.command_manager.active_terms:
+        return zeros
+
+    command_term = env.command_manager.get_term(command_name)
+    heading_target = getattr(command_term, "heading_target", None)
+    if heading_target is None:
+        return zeros
+
+    is_heading_env = getattr(command_term, "is_heading_env", None)
+    heading_error = math_utils.wrap_to_pi(heading_target - asset.data.heading_w)
+    reward = torch.exp(-torch.square(heading_error) / std**2)
+    if is_heading_env is not None:
+        reward *= is_heading_env.float()
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
 def track_lin_vel_xy_yaw_frame_exp(
     env, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -124,6 +147,68 @@ def joint_pos_penalty(
         running_reward,
         stand_still_scale * running_reward,
     )
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def track_ff_target_pos_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    action_name: str = "joint_pos",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    min_ff_abs: float = 1.0e-6,
+) -> torch.Tensor:
+    """Reward tracking the FF-issued joint-position targets on the FF-controlled joints only.
+
+    The reward is active only on joints where the current FF contribution is non-zero. Its effective
+    magnitude is synchronized with the action term's internal ``k_ff`` schedule by multiplying the
+    base reward with ``current_k_ff / initial_k_ff``.
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    device = asset.data.joint_pos.device
+    zeros = torch.zeros(env.num_envs, device=device)
+    if action_name not in env.action_manager.active_terms:
+        return zeros
+
+    action_term = env.action_manager.get_term(action_name)
+    ff_target_positions = getattr(action_term, "ff_target_positions", None)
+    ff_joint_local_ids = getattr(action_term, "ff_joint_local_ids", None)
+    controlled_joint_ids = getattr(action_term, "controlled_joint_ids", None)
+    ff_contribution = getattr(action_term, "ff_contribution", None)
+    current_k_ff = float(getattr(action_term, "k_ff", 0.0))
+    initial_k_ff = float(getattr(action_term, "initial_k_ff", 0.0))
+
+    if (
+        ff_target_positions is None
+        or ff_joint_local_ids is None
+        or controlled_joint_ids is None
+        or ff_contribution is None
+        or current_k_ff <= 0.0
+        or initial_k_ff <= 0.0
+    ):
+        return zeros
+
+    ff_joint_local_ids = ff_joint_local_ids.to(device=device, dtype=torch.long)
+    if ff_joint_local_ids.numel() == 0:
+        return zeros
+
+    controlled_joint_ids = controlled_joint_ids.to(device=device, dtype=torch.long)
+    ff_joint_global_ids = controlled_joint_ids[ff_joint_local_ids]
+    current_pos = asset.data.joint_pos[:, ff_joint_global_ids]
+    target_pos = ff_target_positions[:, ff_joint_local_ids]
+
+    ff_active_mask = torch.abs(ff_contribution[:, ff_joint_local_ids]) > min_ff_abs
+    active_joint_count = ff_active_mask.sum(dim=1)
+    active_env_mask = active_joint_count > 0
+    if not torch.any(active_env_mask):
+        return zeros
+
+    sq_err = torch.square(current_pos - target_pos) * ff_active_mask.float()
+    mean_sq_err = sq_err.sum(dim=1) / active_joint_count.clamp(min=1).float()
+
+    reward = torch.exp(-mean_sq_err / std**2) * active_env_mask.float()
+    reward *= current_k_ff / max(initial_k_ff, 1.0e-6)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 
@@ -552,6 +637,52 @@ def feet_height_body(
     return reward
 
 
+def _terrain_height_under_bodies(
+    env: ManagerBasedRLEnv,
+    body_pos_w: torch.Tensor,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Estimate the terrain height under each body from the nearest valid ray-cast hit."""
+    sensor: RayCaster = env.scene[sensor_cfg.name]
+    ray_hits = sensor.data.ray_hits_w
+    ray_xy = ray_hits[..., :2]
+    ray_z = ray_hits[..., 2]
+
+    valid_hits = torch.isfinite(ray_z)
+    distances = torch.sum((body_pos_w[..., None, :2] - ray_xy[:, None, :, :]) ** 2, dim=-1)
+    distances = torch.where(valid_hits[:, None, :], distances, torch.full_like(distances, float("inf")))
+
+    nearest_ids = torch.argmin(distances, dim=-1)
+    gathered_ground_z = torch.gather(ray_z, 1, nearest_ids)
+    has_valid_hit = valid_hits.any(dim=1, keepdim=True).expand_as(gathered_ground_z)
+
+    return torch.where(has_valid_hit, gathered_ground_z, body_pos_w[..., 2])
+
+
+def feet_height_relative(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    target_height: float,
+    tanh_mult: float,
+) -> torch.Tensor:
+    """Penalize swinging feet that fail to reach a target height above the local terrain."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    feet_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    ground_height = _terrain_height_under_bodies(env, feet_pos_w, sensor_cfg)
+    clearance = feet_pos_w[:, :, 2] - ground_height
+
+    foot_z_target_error = torch.square(clearance - target_height)
+    foot_velocity_tanh = torch.tanh(
+        tanh_mult * torch.linalg.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=2)
+    )
+    reward = torch.sum(foot_z_target_error * foot_velocity_tanh, dim=1)
+    reward *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
 def feet_slide(
     env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -623,13 +754,9 @@ def base_height_l2(
     # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
     if sensor_cfg is not None:
-        sensor: RayCaster = env.scene[sensor_cfg.name]
-        # Adjust the target height using the sensor data
-        ray_hits = sensor.data.ray_hits_w[..., 2]
-        if torch.isnan(ray_hits).any() or torch.isinf(ray_hits).any() or torch.max(torch.abs(ray_hits)) > 1e6:
-            adjusted_target_height = asset.data.root_link_pos_w[:, 2]
-        else:
-            adjusted_target_height = target_height + torch.mean(ray_hits, dim=1)
+        base_pos_w = asset.data.root_pos_w[:, None, :]
+        ground_height = _terrain_height_under_bodies(env, base_pos_w, sensor_cfg).squeeze(1)
+        adjusted_target_height = target_height + ground_height
     else:
         # Use the provided target height directly for flat terrain
         adjusted_target_height = target_height
@@ -680,3 +807,167 @@ def flat_orientation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scen
     reward = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
+
+
+def feet_contact_number(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    action_name: str = "joint_pos",
+    mismatch_penalty: float = 1.3,
+) -> torch.Tensor:
+    """Reward feet contact that matches the expected stance/swing phase."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    actual_contact = torch.norm(net_forces, dim=-1) > 1.0
+
+    lifting_state = None
+    if action_name in env.action_manager.active_terms:
+        action_term = env.action_manager.get_term(action_name)
+        lifting_state = getattr(action_term, "lifting_state", None)
+    if lifting_state is None:
+        from .events import get_feedforward_lifting_state
+
+        lifting_state = get_feedforward_lifting_state(env)
+
+    expected_stance = ~lifting_state.bool()
+    match = actual_contact == expected_stance
+    mismatch = ~match
+    return match.float().sum(dim=1) - mismatch_penalty * mismatch.float().sum(dim=1)
+
+
+def _get_recently_reset_mask(env: ManagerBasedRLEnv) -> torch.Tensor | None:
+    """Return env ids that are at the beginning of a new episode."""
+    if not hasattr(env, "episode_length_buf"):
+        return None
+    reset_mask = env.episode_length_buf <= 1
+    return reset_mask if torch.any(reset_mask) else None
+
+
+def _sanitize_action_delta(delta: torch.Tensor, clamp_value: float | None = None) -> torch.Tensor:
+    """Clamp and sanitize action deltas to avoid a few outliers dominating the reward."""
+    if clamp_value is None:
+        return delta
+    delta = torch.nan_to_num(delta, nan=0.0, posinf=clamp_value, neginf=-clamp_value)
+    return torch.clamp(delta, min=-clamp_value, max=clamp_value)
+
+
+def _prepare_action_smooth_buffers(env: ManagerBasedRLEnv, current: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Initialize and reset the internal history used by the smoothness penalty."""
+    if (
+        not hasattr(env, "_action_smooth_prev")
+        or not hasattr(env, "_action_smooth_prev_prev")
+        or env._action_smooth_prev.shape != current.shape
+        or env._action_smooth_prev_prev.shape != current.shape
+    ):
+        env._action_smooth_prev = current.clone()
+        env._action_smooth_prev_prev = env.action_manager.prev_action.clone()
+
+    reset_mask = _get_recently_reset_mask(env)
+    if reset_mask is not None:
+        env._action_smooth_prev[reset_mask] = current[reset_mask]
+        env._action_smooth_prev_prev[reset_mask] = current[reset_mask]
+
+    return env._action_smooth_prev, env._action_smooth_prev_prev
+
+
+def action_smooth(env: ManagerBasedRLEnv, clamp_value: float | None = None) -> torch.Tensor:
+    """Penalize non-smooth actions with a second-order finite difference.
+
+    The history buffers are reset for environments that just restarted to avoid mixing pre-reset
+    and post-reset actions in the second-order difference.
+    """
+    current = env.action_manager.action
+
+    prev, prev_prev = _prepare_action_smooth_buffers(env, current)
+    second_diff = _sanitize_action_delta(current - 2 * prev + prev_prev, clamp_value=clamp_value)
+    reward = torch.sum(torch.square(second_diff), dim=1)
+
+    env._action_smooth_prev_prev = prev.clone()
+    env._action_smooth_prev = current.clone()
+    return reward
+
+
+def action_rate_l2_safe(env: ManagerBasedRLEnv, clamp_value: float = 5.0) -> torch.Tensor:
+    """Penalize action-rate changes while clipping rare spikes from dominating the batch."""
+    current = env.action_manager.action
+    prev = env.action_manager.prev_action
+
+    reset_mask = _get_recently_reset_mask(env)
+    if reset_mask is not None:
+        prev = prev.clone()
+        prev[reset_mask] = current[reset_mask]
+
+    delta = _sanitize_action_delta(current - prev, clamp_value=clamp_value)
+    return torch.sum(torch.square(delta), dim=1)
+
+
+def action_smooth_safe(env: ManagerBasedRLEnv, clamp_value: float = 5.0) -> torch.Tensor:
+    """Reset-safe and clipped variant of the second-order action smoothness penalty."""
+    return action_smooth(env, clamp_value=clamp_value)
+
+
+def opposite_base_vel(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize base velocity opposite to the commanded x direction."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    vel_cmd = env.command_manager.get_command(command_name)[:, 0]
+    vel_actual = asset.data.root_lin_vel_b[:, 0]
+    return torch.clamp(-torch.sign(vel_cmd) * vel_actual, min=0.0)
+
+
+def opposite_wheel_vel(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize wheel velocity opposite to the commanded x direction."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    vel_cmd = env.command_manager.get_command(command_name)[:, 0]
+    wheel_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    sign_cmd = torch.sign(vel_cmd).unsqueeze(-1)
+    opposite_penalty = torch.clamp(-sign_cmd * wheel_vel, min=0.0)
+    return torch.sum(opposite_penalty, dim=1)
+
+
+def feet_x_symmetry(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize x-axis asymmetry between the two feet in the body frame."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    feet_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    base_pos_w = asset.data.root_pos_w
+    base_quat_w = asset.data.root_quat_w
+
+    feet_pos_rel = feet_pos_w - base_pos_w.unsqueeze(1)
+    feet_pos_b = torch.zeros_like(feet_pos_rel)
+    for i in range(feet_pos_rel.shape[1]):
+        feet_pos_b[:, i, :] = quat_apply_inverse(base_quat_w, feet_pos_rel[:, i, :])
+
+    return torch.abs(feet_pos_b[:, 0, 0] - feet_pos_b[:, 1, 0])
+
+
+def feet_y_distance(
+    env: ManagerBasedRLEnv,
+    min_distance: float = 0.3,
+    max_distance: float = 0.8,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize stance width outside the desired [min_distance, max_distance] range."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    feet_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    base_pos_w = asset.data.root_pos_w
+    base_quat_w = asset.data.root_quat_w
+
+    feet_pos_rel = feet_pos_w - base_pos_w.unsqueeze(1)
+    feet_pos_b = torch.zeros_like(feet_pos_rel)
+    for i in range(feet_pos_rel.shape[1]):
+        feet_pos_b[:, i, :] = quat_apply_inverse(base_quat_w, feet_pos_rel[:, i, :])
+
+    y_dist = torch.abs(feet_pos_b[:, 0, 1] - feet_pos_b[:, 1, 1])
+    penalty_min = torch.clamp(min_distance - y_dist, min=0.0)
+    penalty_max = torch.clamp(y_dist - max_distance, min=0.0)
+    return penalty_min + penalty_max

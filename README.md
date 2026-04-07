@@ -126,6 +126,53 @@ python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
 python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME> --headless --video
 ```
 
+### 训练环境说明
+
+当前 `Tita` 相关训练环境主要包含以下几类：
+
+- `DDT-Velocity-Flat-Tita-v0`
+  平地速度跟踪环境。地形为平面，主要用于基础移动能力训练与策略快速验证。
+
+- `DDT-Velocity-Rough-Tita-v0`
+  粗糙地形速度跟踪环境。包含随机起伏和不规则地形，用于提升策略在非结构化地形上的鲁棒性。
+
+- `DDT-Velocity-Stair-Tita-v0`
+  楼梯环境，使用速度估计器版本策略。适合需要在楼梯等结构化复杂地形上训练、同时显式使用估计器的场景。
+
+- `DDT-Velocity-Stair-Tita-Estimator-v0`
+  与上面同属于楼梯环境估计器版本，当前项目中等价指向 stair estimator 配置。
+
+- `DDT-Velocity-Stair-Tita-NoEstimator-v0`
+  楼梯环境，无速度估计器版本策略。适合直接使用环境观测进行训练，也是目前常用的 stair 训练入口之一。
+
+- `DDT-Velocity-Flat-Tita-NoBaseVel-v0`
+  平地环境，但 observation 中移除了 `base_lin_vel_xy`，通常用于训练速度估计器或研究在缺少机体线速度观测条件下的控制效果。
+
+- `DDT-Velocity-Rough-Tita-NoBaseVel-v0`
+  粗糙地形环境，同时移除了 `base_lin_vel_xy` 观测。适合训练在复杂地形下、缺少直接底盘线速度观测时的策略或估计器。
+
+对应的推理环境名称通常是在训练环境后面加 `-Play-v0`，例如：
+
+- `DDT-Velocity-Flat-Tita-Play-v0`
+- `DDT-Velocity-Rough-Tita-Play-v0`
+- `DDT-Velocity-Stair-Tita-NoEstimator-Play-v0`
+
+其中：
+
+- `Flat`：平地环境
+- `Rough`：粗糙地形环境
+- `Stair`：楼梯环境
+- `NoEstimator`：不使用速度估计器
+- `Estimator`：使用速度估计器
+- `NoBaseVel`：观测中不包含 `base_lin_vel_xy`
+- `Play`：用于推理/测试，不建议直接用于训练
+
+如果只想快速开始，推荐优先使用以下入口：
+
+- 平地基础训练：`DDT-Velocity-Flat-Tita-v0`
+- 粗糙地形训练：`DDT-Velocity-Rough-Tita-v0`
+- 楼梯训练：`DDT-Velocity-Stair-Tita-NoEstimator-v0`
+
 
 
 

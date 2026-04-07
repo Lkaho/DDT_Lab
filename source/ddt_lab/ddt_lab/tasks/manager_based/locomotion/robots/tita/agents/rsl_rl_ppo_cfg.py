@@ -49,3 +49,64 @@ class TitaFlatPPORunnerCfg(TitaRoughPPORunnerCfg):
         self.experiment_name = "tita_flat"
         self.policy.actor_hidden_dims = [128, 128, 128]
         self.policy.critic_hidden_dims = [128, 128, 128]
+
+
+def _enable_velocity_estimator(runner_cfg, experiment_name: str, num_history: int = 3) -> None:
+    runner_cfg.experiment_name = experiment_name
+    runner_cfg.policy.class_name = "ActorCriticWithEstimator"
+    runner_cfg.algorithm.class_name = "PPOWithEstimator"
+    runner_cfg.policy.estimator_hidden_dims = [256, 128]
+    runner_cfg.policy.num_history = num_history
+    runner_cfg.policy.estimator_output_dim = 2
+    runner_cfg.algorithm.estimator_loss_coef = 1.0
+    runner_cfg.obs_groups = {
+        "policy": ["policy"],
+        "critic": ["critic"],
+        "history": ["history"],
+        "privileged": ["privileged"],
+    }
+
+
+@configclass
+class TitaRoughNoBaseVelEstimatorPPORunnerCfg(TitaRoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _enable_velocity_estimator(self, "tita_rough_no_base_vel_estimator", num_history=10)
+        self.policy.estimated_history_length = 10
+        self.policy.history_term_dims = [3, 3, 3, 6, 8, 8]
+        self.policy.deploy_share_policy_and_history = True
+
+
+@configclass
+class TitaFlatNoBaseVelEstimatorPPORunnerCfg(TitaFlatPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _enable_velocity_estimator(self, "tita_flat_no_base_vel_estimator", num_history=10)
+        self.policy.estimated_history_length = 10
+        self.policy.history_term_dims = [3, 3, 3, 6, 8, 8]
+        self.policy.deploy_share_policy_and_history = True
+
+
+@configclass
+class TitaStairEstimatorPPORunnerCfg(TitaRoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.max_iterations = 30000
+        self.empirical_normalization = None
+        self.policy.actor_obs_normalization = True
+        self.policy.critic_obs_normalization = True
+        _enable_velocity_estimator(self, "tita_stair_estimator", num_history=5)
+        self.algorithm.estimator_loss_coef = 0.2
+
+
+@configclass
+class TitaStairPPORunnerCfg(TitaRoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.max_iterations = 30000
+        self.experiment_name = "tita_stair"
+        self.empirical_normalization = None
+        self.policy.actor_obs_normalization = True
+        self.policy.critic_obs_normalization = True

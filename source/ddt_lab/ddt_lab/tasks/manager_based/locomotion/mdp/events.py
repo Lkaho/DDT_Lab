@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+_feedforward_modifiers: dict[int, object] = {}
+
+
 def randomize_rigid_body_inertia(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,
@@ -242,3 +245,54 @@ def _randomize_prop_by_op(
             f"Unknown operation: '{operation}' for property randomization. Please use 'add', 'scale', or 'abs'."
         )
     return data
+
+
+def apply_feedforward_trajectory(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    contact_sensor_name: str = "contact_forces",
+    contact_body_pattern: str = ".*_leg_4",
+    feedforward_joint_names: list[str] | None = None,
+    feedforward_amplitude: dict[str, float] | None = None,
+    feedforward_period: float = 0.6,
+    k_ff: float = 0.3,
+    contact_force_threshold: float = 50.0,
+    followup_trigger_delay_factor: float = 0.0,
+):
+    """Apply a contact-triggered feedforward trajectory modifier on every step."""
+    from .feedforward_modifier import FeedforwardModifier
+
+    env_key = id(env)
+    if env_key not in _feedforward_modifiers:
+        _feedforward_modifiers[env_key] = FeedforwardModifier(
+            env=env,
+            asset_cfg=asset_cfg,
+            contact_sensor_name=contact_sensor_name,
+            contact_body_pattern=contact_body_pattern,
+            feedforward_joint_names=feedforward_joint_names,
+            feedforward_amplitude=feedforward_amplitude,
+            feedforward_period=feedforward_period,
+            k_ff=k_ff,
+            contact_force_threshold=contact_force_threshold,
+            followup_trigger_delay_factor=followup_trigger_delay_factor,
+        )
+    _feedforward_modifiers[env_key].update()
+
+
+def reset_feedforward_modifier(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+):
+    """Reset the feedforward modifier state on episode reset."""
+    env_key = id(env)
+    if env_key in _feedforward_modifiers:
+        _feedforward_modifiers[env_key].reset(env_ids)
+
+
+def get_feedforward_lifting_state(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return the current feedforward lifting state for the two legs."""
+    env_key = id(env)
+    if env_key in _feedforward_modifiers:
+        return _feedforward_modifiers[env_key].lifting_state
+    return torch.zeros(env.num_envs, 2, dtype=torch.bool, device=env.device)
