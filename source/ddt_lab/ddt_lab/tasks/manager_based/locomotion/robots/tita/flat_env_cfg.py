@@ -5,7 +5,7 @@
 
 from isaaclab.utils import configclass
 
-from .rough_env_cfg import TitaRoughEnvCfg
+from .rough_env_cfg import TitaRoughEnvCfg, configure_forward_only_play_commands
 
 
 @configclass
@@ -54,6 +54,7 @@ class TitaFlatEnvCfg_PLAY(TitaFlatEnvCfg):
     def __post_init__(self) -> None:
         # post init of parent
         super().__post_init__()
+        configure_forward_only_play_commands(self)
 
         # make a smaller scene for play
         self.scene.num_envs = 50

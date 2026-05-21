@@ -8,21 +8,19 @@
 from isaaclab.utils import configclass
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import ddt_lab.tasks.manager_based.locomotion.mdp as mdp
 
-from .rough_env_cfg import (
-    TitaRoughEnvCfg,
-    SceneCfg,
-    CommandsCfg,
-    ActionsCfg,
-    EventCfg,
-    RewardsCfg,
-    TerminationsCfg,
-    CurriculumCfg,
-)
+from .rough_env_cfg import TitaRoughEnvCfg, configure_forward_only_play_commands
+
+
+ESTIMATOR_TARGET_BASE_LIN_VEL_XY_SCALE = [1.0, 1.0]
+ESTIMATOR_POLICY_BASE_LIN_VEL_XY_SCALE = [2.0, 2.0]
+ESTIMATOR_HISTORY_LENGTH = 3
+ESTIMATOR_FEATURE_HISTORY_LENGTH = 10
 
 
 @configclass
@@ -105,6 +103,12 @@ class ObservationsCfgWithoutBaseVel:
             scale=0.05,
         )
         actions = ObsTerm(func=mdp.last_action, scale=1.0)
+        height_scan = ObsTerm(
+            func=mdp.safe_height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            clip=(-1.0, 1.0),
+            scale=1.0,
+        )
 
         def __post_init__(self):
             self.history_length = 1
@@ -113,7 +117,7 @@ class ObservationsCfgWithoutBaseVel:
     class PrivilegedCfg(ObsGroup):
         """Supervision targets for the velocity estimator."""
 
-        base_lin_vel_xy = ObsTerm(func=mdp.base_lin_vel_xy, scale=2.0)
+        base_lin_vel_xy = ObsTerm(func=mdp.base_lin_vel_xy, scale=1.0)
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -127,18 +131,26 @@ class ObservationsCfgWithoutBaseVel:
 
 
 @configclass
-class TitaRoughNoBaseVelEnvCfg(TitaRoughEnvCfg):
-    """Tita rough terrain environment without base_lin_vel_xy observation."""
+class ObservationsCfgWithoutBaseVelNoEstimator:
+    """Observation specifications without base linear velocity xy and without a velocity estimator."""
 
-    observations: ObservationsCfgWithoutBaseVel = ObservationsCfgWithoutBaseVel()
+    @configclass
+    class PolicyCfg(ObservationsCfgWithoutBaseVel.PolicyCfg):
+        """Actor observations without base_lin_vel_xy and without estimator history."""
 
-    def __post_init__(self):
-        super().__post_init__()
+    @configclass
+    class CriticCfg(ObservationsCfgWithoutBaseVel.CriticCfg):
+        """Critic observations without estimator-only groups."""
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 @configclass
-class TitaFlatNoBaseVelEnvCfg(TitaRoughNoBaseVelEnvCfg):
-    """Tita flat terrain environment without base_lin_vel_xy observation."""
+class TitaFlatNoBaseVelEnvCfg(TitaRoughEnvCfg):
+    """Tita flat terrain environment without base_lin_vel_xy, with velocity estimation."""
+
+    observations: ObservationsCfgWithoutBaseVel = ObservationsCfgWithoutBaseVel()
 
     def __post_init__(self):
         super().__post_init__()
@@ -147,36 +159,109 @@ class TitaFlatNoBaseVelEnvCfg(TitaRoughNoBaseVelEnvCfg):
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
 
-        # Remove height scanner
-        self.scene.height_scanner = None
-        self.observations.policy.height_scan = None
-
         # No terrain curriculum
         self.curriculum.terrain_levels = None
+        self.commands.base_velocity.rel_standing_envs = 0.1
+
+        self.rewards.feet_y_distance = RewTerm(
+            func=mdp.feet_y_distance,
+            weight=-2.0,
+            params={
+                "min_distance": 0.5,
+                "max_distance": 0.6,
+                "asset_cfg": SceneEntityCfg("robot", body_names=[".*_leg_4"]),
+            },
+        )
+        self.rewards.stand_still = RewTerm(
+            func=mdp.stand_still,
+            weight=-1.0,
+            params={
+                "command_name": "base_velocity",
+                "command_threshold": 0.15,
+                "asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"]),
+            },
+        )
+        self.rewards.zero_command_wheel_vel = RewTerm(
+            func=mdp.zero_command_wheel_vel_l1,
+            weight=-0.1,
+            params={
+                "command_name": "base_velocity",
+                "command_threshold": 0.15,
+                "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+            },
+        )
+        self.rewards.opposite_wheel_vel = RewTerm(
+            func=mdp.opposite_wheel_vel,
+            weight=-1.0,
+            params={
+                "command_name": "base_velocity",
+                "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+            },
+        )
 
 
 @configclass
-class TitaRoughNoBaseVelEnvCfg_PLAY(TitaRoughNoBaseVelEnvCfg):
-    """Play configuration for rough terrain without base_lin_vel_xy."""
+class TitaFlatNoBaseVelNoEstimatorEnvCfg(TitaRoughEnvCfg):
+    """Tita flat terrain environment without base_lin_vel_xy and without velocity estimation."""
+
+    observations: ObservationsCfgWithoutBaseVelNoEstimator = ObservationsCfgWithoutBaseVelNoEstimator()
 
     def __post_init__(self):
         super().__post_init__()
 
-        # Smaller scene for play
-        self.scene.num_envs = 50
-        self.scene.env_spacing = 2.5
-        self.scene.terrain.max_init_terrain_level = None
+        # Change terrain to flat
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
 
-        if self.scene.terrain.terrain_generator is not None:
-            self.scene.terrain.terrain_generator.num_rows = 5
-            self.scene.terrain.terrain_generator.num_cols = 5
-            self.scene.terrain.terrain_generator.curriculum = False
+        # No terrain curriculum
+        self.curriculum.terrain_levels = None
+        self.commands.base_velocity.rel_standing_envs = 0.1
 
-        # Disable randomization
-        self.observations.policy.enable_corruption = False
-        self.observations.history.enable_corruption = False
-        self.events.base_external_force_torque = None
-        self.events.push_robot = None
+        self.rewards.feet_y_distance = RewTerm(
+            func=mdp.feet_y_distance,
+            weight=-2.0,
+            params={
+                "min_distance": 0.48,
+                "max_distance": 0.6,
+                "asset_cfg": SceneEntityCfg("robot", body_names=[".*_leg_4"]),
+            },
+        )
+        # self.rewards.stand_still = RewTerm(
+        #     func=mdp.stand_still,
+        #     weight=-0.5,
+        #     params={
+        #         "command_name": "base_velocity",
+        #         "command_threshold": 0.15,
+        #         "asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"]),
+        #     },
+        # )
+        # self.rewards.zero_command_base_ang_vel_z = RewTerm(
+        #     func=mdp.zero_command_base_ang_vel_z_l2,
+        #     weight=-2.0,
+        #     params={"command_name": "base_velocity", "command_threshold": 0.15},
+        # )
+        # self.rewards.zero_command_base_lin_vel_xy = RewTerm(
+        #     func=mdp.zero_command_base_lin_vel_xy_l2,
+        #     weight=-1.0,
+        #     params={"command_name": "base_velocity", "command_threshold": 0.15},
+        # )
+        self.rewards.zero_command_wheel_vel = RewTerm(
+            func=mdp.zero_command_wheel_vel_l1,
+            weight=-0.05,
+            params={
+                "command_name": "base_velocity",
+                "command_threshold": 0.15,
+                "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+            },
+        )
+        self.rewards.opposite_wheel_vel = RewTerm(
+            func=mdp.opposite_wheel_vel,
+            weight=-0.2,
+            params={
+                "command_name": "base_velocity",
+                "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+            },
+        )
 
 
 @configclass
@@ -185,6 +270,7 @@ class TitaFlatNoBaseVelEnvCfg_PLAY(TitaFlatNoBaseVelEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        configure_forward_only_play_commands(self)
 
         # Smaller scene for play
         self.scene.num_envs = 50
@@ -193,6 +279,30 @@ class TitaFlatNoBaseVelEnvCfg_PLAY(TitaFlatNoBaseVelEnvCfg):
         # Disable observation noise
         self.observations.policy.enable_corruption = False
         self.observations.history.enable_corruption = False
+
+        # Remove all domain randomization events
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        self.events.add_base_inertia = None
+        self.events.add_base_com = None
+        self.events.add_base_mass = None
+        self.events.randomize_actuator_gains = None
+
+
+@configclass
+class TitaFlatNoBaseVelNoEstimatorEnvCfg_PLAY(TitaFlatNoBaseVelNoEstimatorEnvCfg):
+    """Play configuration for flat terrain without base_lin_vel_xy and without velocity estimation."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        configure_forward_only_play_commands(self)
+
+        # Smaller scene for play
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+
+        # Disable observation noise
+        self.observations.policy.enable_corruption = False
 
         # Remove all domain randomization events
         self.events.base_external_force_torque = None

@@ -22,6 +22,182 @@ if TYPE_CHECKING:
 _feedforward_modifiers: dict[int, object] = {}
 
 
+def _resolve_env_ids(env: ManagerBasedEnv, env_ids: torch.Tensor | slice | None) -> torch.Tensor:
+    if env_ids is None:
+        return torch.arange(env.scene.num_envs, device=env.device, dtype=torch.long)
+    if isinstance(env_ids, slice):
+        return torch.arange(env.scene.num_envs, device=env.device, dtype=torch.long)[env_ids]
+    return torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+
+def reset_joints_to_positions(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    joint_positions: list[float] | tuple[float, ...],
+    velocity_range: tuple[float, float] = (0.0, 0.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    use_soft_joint_pos_limits: bool = True,
+):
+    """Reset selected joints to fixed absolute positions while keeping the asset defaults unchanged."""
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    if asset_cfg.joint_ids != slice(None):
+        iter_env_ids = env_ids[:, None]
+    else:
+        iter_env_ids = env_ids
+
+    joint_pos = asset.data.default_joint_pos[iter_env_ids, asset_cfg.joint_ids].clone()
+    target_joint_pos = torch.tensor(joint_positions, dtype=joint_pos.dtype, device=joint_pos.device).view(1, -1)
+    if target_joint_pos.shape[-1] != joint_pos.shape[-1]:
+        raise ValueError(f"Expected {joint_pos.shape[-1]} joint positions, got {target_joint_pos.shape[-1]}.")
+    joint_pos = target_joint_pos.expand_as(joint_pos).clone()
+
+    joint_vel = asset.data.default_joint_vel[iter_env_ids, asset_cfg.joint_ids].clone()
+    joint_vel += math_utils.sample_uniform(*velocity_range, joint_vel.shape, joint_vel.device)
+
+    joint_pos_limit_source = asset.data.soft_joint_pos_limits if use_soft_joint_pos_limits else asset.data.joint_pos_limits
+    joint_pos_limits = joint_pos_limit_source[iter_env_ids, asset_cfg.joint_ids]
+    joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+    joint_vel_limits = asset.data.soft_joint_vel_limits[iter_env_ids, asset_cfg.joint_ids]
+    joint_vel = joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
+
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=asset_cfg.joint_ids, env_ids=env_ids)
+
+
+def reset_joints_by_offset_per_joint(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    position_ranges: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+    velocity_range: tuple[float, float] = (0.0, 0.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    use_soft_joint_pos_limits: bool = True,
+):
+    """Reset selected joints around default positions using per-joint offset ranges."""
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    if asset_cfg.joint_ids != slice(None):
+        iter_env_ids = env_ids[:, None]
+    else:
+        iter_env_ids = env_ids
+
+    joint_pos = asset.data.default_joint_pos[iter_env_ids, asset_cfg.joint_ids].clone()
+    if len(position_ranges) != joint_pos.shape[-1]:
+        raise ValueError(f"Expected {joint_pos.shape[-1]} joint offset ranges, got {len(position_ranges)}.")
+
+    range_lows = torch.tensor(
+        [offset_range[0] for offset_range in position_ranges],
+        dtype=joint_pos.dtype,
+        device=joint_pos.device,
+    ).view(1, -1)
+    range_highs = torch.tensor(
+        [offset_range[1] for offset_range in position_ranges],
+        dtype=joint_pos.dtype,
+        device=joint_pos.device,
+    ).view(1, -1)
+    joint_pos += range_lows + torch.rand_like(joint_pos) * (range_highs - range_lows)
+
+    joint_vel = asset.data.default_joint_vel[iter_env_ids, asset_cfg.joint_ids].clone()
+    joint_vel += math_utils.sample_uniform(*velocity_range, joint_vel.shape, joint_vel.device)
+
+    joint_pos_limit_source = asset.data.soft_joint_pos_limits if use_soft_joint_pos_limits else asset.data.joint_pos_limits
+    joint_pos_limits = joint_pos_limit_source[iter_env_ids, asset_cfg.joint_ids]
+    joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+    joint_vel_limits = asset.data.soft_joint_vel_limits[iter_env_ids, asset_cfg.joint_ids]
+    joint_vel = joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
+
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=asset_cfg.joint_ids, env_ids=env_ids)
+
+
+def reset_joints_to_positions_by_standing_command(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    standing_joint_positions: list[float] | tuple[float, ...],
+    moving_joint_positions: list[float] | tuple[float, ...],
+    moving_position_range: tuple[float, float],
+    velocity_range: tuple[float, float] = (0.0, 0.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    use_soft_joint_pos_limits: bool = True,
+):
+    """Reset standing-command envs to fixed defaults and other envs to a scaled moving pose."""
+    env_ids_tensor = _resolve_env_ids(env, env_ids)
+    if env_ids_tensor.numel() == 0:
+        return
+
+    command_term = None
+    if command_name in env.command_manager.active_terms:
+        command_term = env.command_manager.get_term(command_name)
+        presample_for_reset = getattr(command_term, "presample_for_reset", None)
+        if presample_for_reset is not None:
+            presample_for_reset(env_ids_tensor)
+
+    is_standing_env = getattr(command_term, "is_standing_env", None)
+    if is_standing_env is None:
+        standing_mask = torch.zeros(env_ids_tensor.shape, dtype=torch.bool, device=env_ids_tensor.device)
+    else:
+        standing_mask = is_standing_env[env_ids_tensor].to(device=env_ids_tensor.device)
+
+    standing_env_ids = env_ids_tensor[standing_mask]
+    moving_env_ids = env_ids_tensor[~standing_mask]
+
+    if standing_env_ids.numel() > 0:
+        reset_joints_to_positions(
+            env=env,
+            env_ids=standing_env_ids,
+            joint_positions=standing_joint_positions,
+            velocity_range=velocity_range,
+            asset_cfg=asset_cfg,
+            use_soft_joint_pos_limits=use_soft_joint_pos_limits,
+        )
+    if moving_env_ids.numel() > 0:
+        reset_joints_to_positions_by_scale(
+            env=env,
+            env_ids=moving_env_ids,
+            joint_positions=moving_joint_positions,
+            position_range=moving_position_range,
+            velocity_range=velocity_range,
+            asset_cfg=asset_cfg,
+            use_soft_joint_pos_limits=use_soft_joint_pos_limits,
+        )
+
+
+def reset_joints_to_positions_by_scale(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    joint_positions: list[float] | tuple[float, ...],
+    position_range: tuple[float, float],
+    velocity_range: tuple[float, float] = (0.0, 0.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    use_soft_joint_pos_limits: bool = True,
+):
+    """Reset joints like ``reset_joints_by_scale`` but use provided reference joint positions."""
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    if asset_cfg.joint_ids != slice(None):
+        iter_env_ids = env_ids[:, None]
+    else:
+        iter_env_ids = env_ids
+
+    joint_pos = asset.data.default_joint_pos[iter_env_ids, asset_cfg.joint_ids].clone()
+    target_joint_pos = torch.tensor(joint_positions, dtype=joint_pos.dtype, device=joint_pos.device).view(1, -1)
+    if target_joint_pos.shape[-1] != joint_pos.shape[-1]:
+        raise ValueError(f"Expected {joint_pos.shape[-1]} joint positions, got {target_joint_pos.shape[-1]}.")
+
+    joint_pos = target_joint_pos.expand_as(joint_pos).clone()
+    joint_pos *= math_utils.sample_uniform(*position_range, joint_pos.shape, joint_pos.device)
+
+    joint_vel = asset.data.default_joint_vel[iter_env_ids, asset_cfg.joint_ids].clone()
+    joint_vel *= math_utils.sample_uniform(*velocity_range, joint_vel.shape, joint_vel.device)
+
+    joint_pos_limit_source = asset.data.soft_joint_pos_limits if use_soft_joint_pos_limits else asset.data.joint_pos_limits
+    joint_pos_limits = joint_pos_limit_source[iter_env_ids, asset_cfg.joint_ids]
+    joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+    joint_vel_limits = asset.data.soft_joint_vel_limits[iter_env_ids, asset_cfg.joint_ids]
+    joint_vel = joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
+
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=asset_cfg.joint_ids, env_ids=env_ids)
+
+
 def randomize_rigid_body_inertia(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import isaaclab.utils.math as math_utils
@@ -117,12 +118,102 @@ def stand_still(
     command_name: str,
     command_threshold: float = 0.06,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    actual_velocity_threshold: float | None = None,
 ) -> torch.Tensor:
     """Penalize offsets from the default joint positions when the command is very small."""
     # Penalize motion when command is nearly zero.
     reward = mdp.joint_deviation_l1(env, asset_cfg)
-    reward *= torch.norm(env.command_manager.get_command(command_name), dim=1) < command_threshold
+    reward *= _zero_command_mask(
+        env,
+        command_name,
+        command_threshold,
+        actual_velocity_threshold=actual_velocity_threshold,
+        asset_cfg=asset_cfg,
+    )
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def _zero_command_mask(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    command_threshold: float,
+    actual_velocity_threshold: float | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    cmd_still = torch.norm(env.command_manager.get_command(command_name), dim=1) < command_threshold
+    if actual_velocity_threshold is None:
+        return cmd_still
+
+    asset: RigidObject = env.scene[asset_cfg.name]
+    actual_still = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1) < actual_velocity_threshold
+    return cmd_still & actual_still
+
+
+def _upright_scale(env: ManagerBasedRLEnv) -> torch.Tensor:
+    return torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+
+def zero_command_base_ang_vel_z_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    command_threshold: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    actual_velocity_threshold: float | None = None,
+) -> torch.Tensor:
+    """Penalize yaw rotation only when the commanded base velocity is near zero."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    reward = torch.square(asset.data.root_ang_vel_b[:, 2])
+    reward *= _zero_command_mask(
+        env,
+        command_name,
+        command_threshold,
+        actual_velocity_threshold=actual_velocity_threshold,
+        asset_cfg=asset_cfg,
+    )
+    reward *= _upright_scale(env)
+    return reward
+
+
+def zero_command_base_lin_vel_xy_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    command_threshold: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    actual_velocity_threshold: float | None = None,
+) -> torch.Tensor:
+    """Penalize planar base drift only when the commanded base velocity is near zero."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    reward = torch.sum(torch.square(asset.data.root_lin_vel_b[:, :2]), dim=1)
+    reward *= _zero_command_mask(
+        env,
+        command_name,
+        command_threshold,
+        actual_velocity_threshold=actual_velocity_threshold,
+        asset_cfg=asset_cfg,
+    )
+    reward *= _upright_scale(env)
+    return reward
+
+
+def zero_command_wheel_vel_l1(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    command_threshold: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    actual_velocity_threshold: float | None = None,
+) -> torch.Tensor:
+    """Penalize wheel spin only when the commanded base velocity is near zero."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    reward = torch.sum(torch.abs(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
+    reward *= _zero_command_mask(
+        env,
+        command_name,
+        command_threshold,
+        actual_velocity_threshold=actual_velocity_threshold,
+        asset_cfg=asset_cfg,
+    )
+    reward *= _upright_scale(env)
     return reward
 
 
@@ -213,6 +304,37 @@ def track_ff_target_pos_exp(
     return reward
 
 
+def _get_lifting_state(env: ManagerBasedRLEnv, action_name: str = "joint_pos") -> torch.Tensor:
+    lifting_state = None
+    if action_name in env.action_manager.active_terms:
+        action_term = env.action_manager.get_term(action_name)
+        lifting_state = getattr(action_term, "lifting_state", None)
+    if lifting_state is None:
+        from .events import get_feedforward_lifting_state
+
+        lifting_state = get_feedforward_lifting_state(env)
+    return lifting_state.bool()
+
+
+def joint_deviation_l2_no_lift(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    command_threshold: float = 0.1,
+    action_name: str = "joint_pos",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize default-pose deviation while moving only when no leg is in a triggered lift phase."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_error = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    reward = torch.sum(torch.square(joint_error), dim=1)
+
+    command_active = torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > command_threshold
+    no_lift = ~_get_lifting_state(env, action_name=action_name).any(dim=1)
+    reward *= command_active & no_lift
+    reward *= _upright_scale(env)
+    return reward
+
+
 def wheel_vel_penalty(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
@@ -235,6 +357,24 @@ def wheel_vel_penalty(
         standing_reward,
     )
     return reward
+
+
+def wheel_spin_penalty(
+    env: ManagerBasedRLEnv,
+    wheel_joint_cfg: SceneEntityCfg,
+    foot_body_cfg: SceneEntityCfg,
+    wheel_radius: float = 0.0925,
+    spin_scale: float = 0.8,
+    slip_deadband: float = 0.1,
+) -> torch.Tensor:
+    """Penalize wheel surface speed that exceeds the corresponding foot link world-frame speed."""
+    asset: Articulation = env.scene[wheel_joint_cfg.name]
+    foot_asset: Articulation = env.scene[foot_body_cfg.name]
+
+    wheel_surface_speed = wheel_radius * torch.abs(asset.data.joint_vel[:, wheel_joint_cfg.joint_ids])
+    foot_speed = torch.linalg.norm(foot_asset.data.body_lin_vel_w[:, foot_body_cfg.body_ids, :2], dim=2)
+    slip = torch.clamp(spin_scale * wheel_surface_speed - foot_speed - slip_deadband, min=0.0)
+    return torch.sum(slip, dim=1)
 
 
 class GaitReward(ManagerTermBase):
@@ -361,6 +501,18 @@ def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joint
     return reward
 
 
+def stair_joint_mirror(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    mirror_joints: list[list[str]],
+    action_name: str = "joint_pos",
+) -> torch.Tensor:
+    """Mirror penalty that is disabled while either leg is in a triggered lift phase."""
+    reward = joint_mirror(env, asset_cfg, mirror_joints)
+    lifting_state = _get_lifting_state(env, action_name=action_name)
+    return reward.masked_fill(lifting_state.bool().any(dim=1), 0.0)
+
+
 def action_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joints: list[list[str]]) -> torch.Tensor:
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
@@ -421,7 +573,12 @@ def action_sync(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, joint_groups:
 
 
 def feet_air_time(
-    env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg, threshold: float
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float,
+    triggered_only: bool = False,
+    action_name: str = "joint_pos",
 ) -> torch.Tensor:
     """Reward long steps taken by the feet using L2-kernel.
 
@@ -436,7 +593,11 @@ def feet_air_time(
     # compute the reward
     first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
     last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
-    reward = torch.sum((last_air_time - threshold) * first_contact, dim=1)
+    reward_per_foot = (last_air_time - threshold) * first_contact
+    if triggered_only:
+        lifting_mask = _get_lifting_state(env, action_name=action_name)[:, : reward_per_foot.shape[1]]
+        reward_per_foot = reward_per_foot * lifting_mask.float()
+    reward = torch.sum(reward_per_foot, dim=1)
     # no reward for zero command
     reward *= torch.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
@@ -683,6 +844,40 @@ def feet_height_relative(
     return reward
 
 
+def feet_height_band_relative(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    target_height: float,
+    std: float,
+    tanh_mult: float,
+    wheel_radius: float = 0.0925,
+    action_name: str = "joint_pos",
+) -> torch.Tensor:
+    """Reward triggered lifting feet for matching a target clearance above local terrain."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    feet_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    ground_height = _terrain_height_under_bodies(env, feet_pos_w, sensor_cfg)
+    clearance = feet_pos_w[:, :, 2] - ground_height - wheel_radius
+
+    lifting_state = _get_lifting_state(env, action_name=action_name)[:, : clearance.shape[1]]
+    lifting_mask = lifting_state.float()
+    active_count = lifting_mask.sum(dim=1)
+    active_env_mask = active_count > 0
+    height_error = torch.square(clearance - target_height) * lifting_mask
+
+    foot_velocity_tanh = torch.tanh(
+        tanh_mult * torch.linalg.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=2)
+    )
+    mean_sq_err = height_error.sum(dim=1) / active_count.clamp(min=1.0)
+    velocity_gate = (foot_velocity_tanh * lifting_mask).sum(dim=1) / active_count.clamp(min=1.0)
+    reward = torch.exp(-mean_sq_err / std**2) * velocity_gate * active_env_mask.float()
+    reward *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
 def feet_slide(
     env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -814,25 +1009,28 @@ def feet_contact_number(
     sensor_cfg: SceneEntityCfg,
     action_name: str = "joint_pos",
     mismatch_penalty: float = 1.3,
+    contact_threshold: float = 10.0,
 ) -> torch.Tensor:
-    """Reward feet contact that matches the expected stance/swing phase."""
+    """Reward contact state matching the expected stance/swing phase."""
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
-    actual_contact = torch.norm(net_forces, dim=-1) > 1.0
+    actual_contact = net_forces[..., 2] > contact_threshold
 
-    lifting_state = None
-    if action_name in env.action_manager.active_terms:
-        action_term = env.action_manager.get_term(action_name)
-        lifting_state = getattr(action_term, "lifting_state", None)
-    if lifting_state is None:
-        from .events import get_feedforward_lifting_state
-
-        lifting_state = get_feedforward_lifting_state(env)
-
+    lifting_state = _get_lifting_state(env, action_name=action_name)[:, : net_forces.shape[1]]
     expected_stance = ~lifting_state.bool()
+
     match = actual_contact == expected_stance
     mismatch = ~match
-    return match.float().sum(dim=1) - mismatch_penalty * mismatch.float().sum(dim=1)
+    score = match.float().sum(dim=1) - mismatch_penalty * mismatch.float().sum(dim=1)
+
+    double_stance_match = expected_stance.all(dim=1) & actual_contact.all(dim=1)
+    double_swing_match = (~expected_stance).all(dim=1) & (~actual_contact).all(dim=1)
+    zero_reward_mask = double_stance_match | double_swing_match
+    return torch.where(
+        zero_reward_mask,
+        torch.zeros(env.num_envs, device=net_forces.device),
+        score,
+    )
 
 
 def _get_recently_reset_mask(env: ManagerBasedRLEnv) -> torch.Tensor | None:
@@ -849,6 +1047,46 @@ def _sanitize_action_delta(delta: torch.Tensor, clamp_value: float | None = None
         return delta
     delta = torch.nan_to_num(delta, nan=0.0, posinf=clamp_value, neginf=-clamp_value)
     return torch.clamp(delta, min=-clamp_value, max=clamp_value)
+
+
+def _get_action_term_slice(
+    env: ManagerBasedRLEnv, action_name: str
+) -> tuple[slice | None, object | None]:
+    """Resolve the slice occupied by an action term inside the concatenated action tensor."""
+    start = 0
+    for name, dim in zip(env.action_manager.active_terms, env.action_manager.action_term_dim):
+        end = start + dim
+        if name == action_name:
+            return slice(start, end), env.action_manager.get_term(name)
+        start = end
+    return None, None
+
+
+def _get_action_term_history(
+    env: ManagerBasedRLEnv,
+    action_name: str,
+    scale_with_term: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Fetch current and previous actions for a single action term.
+
+    When ``scale_with_term`` is enabled, the returned actions are mapped into the term's processed
+    command space using the term's internal scale. This is useful for wheel actions where the policy
+    outputs are normalized but the deployed command magnitude is much larger.
+    """
+    action_slice, action_term = _get_action_term_slice(env, action_name)
+    if action_slice is None or action_term is None:
+        return None, None
+
+    current = env.action_manager.action[:, action_slice]
+    prev = env.action_manager.prev_action[:, action_slice]
+
+    if scale_with_term:
+        action_scale = getattr(action_term, "_scale", None)
+        if action_scale is not None:
+            current = current * action_scale
+            prev = prev * action_scale
+
+    return current, prev
 
 
 def _prepare_action_smooth_buffers(env: ManagerBasedRLEnv, current: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -868,6 +1106,40 @@ def _prepare_action_smooth_buffers(env: ManagerBasedRLEnv, current: torch.Tensor
         env._action_smooth_prev_prev[reset_mask] = current[reset_mask]
 
     return env._action_smooth_prev, env._action_smooth_prev_prev
+
+
+def _prepare_action_smooth_buffers_for_term(
+    env: ManagerBasedRLEnv,
+    current: torch.Tensor,
+    prev: torch.Tensor,
+    buffer_key: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Initialize and reset term-specific history used by the smoothness penalty."""
+    if not hasattr(env, "_action_smooth_prev_by_term") or not isinstance(env._action_smooth_prev_by_term, dict):
+        env._action_smooth_prev_by_term = {}
+    if not hasattr(env, "_action_smooth_prev_prev_by_term") or not isinstance(
+        env._action_smooth_prev_prev_by_term, dict
+    ):
+        env._action_smooth_prev_prev_by_term = {}
+
+    prev_buffers = env._action_smooth_prev_by_term
+    prev_prev_buffers = env._action_smooth_prev_prev_by_term
+
+    if (
+        buffer_key not in prev_buffers
+        or buffer_key not in prev_prev_buffers
+        or prev_buffers[buffer_key].shape != current.shape
+        or prev_prev_buffers[buffer_key].shape != current.shape
+    ):
+        prev_buffers[buffer_key] = current.clone()
+        prev_prev_buffers[buffer_key] = prev.clone()
+
+    reset_mask = _get_recently_reset_mask(env)
+    if reset_mask is not None:
+        prev_buffers[buffer_key][reset_mask] = current[reset_mask]
+        prev_prev_buffers[buffer_key][reset_mask] = current[reset_mask]
+
+    return prev_buffers[buffer_key], prev_prev_buffers[buffer_key]
 
 
 def action_smooth(env: ManagerBasedRLEnv, clamp_value: float | None = None) -> torch.Tensor:
@@ -904,6 +1176,85 @@ def action_rate_l2_safe(env: ManagerBasedRLEnv, clamp_value: float = 5.0) -> tor
 def action_smooth_safe(env: ManagerBasedRLEnv, clamp_value: float = 5.0) -> torch.Tensor:
     """Reset-safe and clipped variant of the second-order action smoothness penalty."""
     return action_smooth(env, clamp_value=clamp_value)
+
+
+def action_rate_l2_for_term_safe(
+    env: ManagerBasedRLEnv,
+    action_name: str,
+    clamp_value: float = 5.0,
+    scale_with_term: bool = True,
+) -> torch.Tensor:
+    """Penalize action-rate changes for a single action term.
+
+    This is useful for selectively damping wheel actions without over-regularizing the leg joints.
+    """
+    current, prev = _get_action_term_history(env, action_name=action_name, scale_with_term=scale_with_term)
+    if current is None or prev is None:
+        return torch.zeros(env.num_envs, device=env.action_manager.action.device)
+
+    reset_mask = _get_recently_reset_mask(env)
+    if reset_mask is not None:
+        prev = prev.clone()
+        prev[reset_mask] = current[reset_mask]
+
+    delta = _sanitize_action_delta(current - prev, clamp_value=clamp_value)
+    return torch.sum(torch.square(delta), dim=1)
+
+
+def action_smooth_for_term_safe(
+    env: ManagerBasedRLEnv,
+    action_name: str,
+    clamp_value: float = 5.0,
+    scale_with_term: bool = True,
+) -> torch.Tensor:
+    """Reset-safe second-order smoothness penalty for a single action term."""
+    current, prev = _get_action_term_history(env, action_name=action_name, scale_with_term=scale_with_term)
+    if current is None or prev is None:
+        return torch.zeros(env.num_envs, device=env.action_manager.action.device)
+
+    buffer_key = f"{action_name}:{'scaled' if scale_with_term else 'raw'}"
+    prev_buffer, prev_prev_buffer = _prepare_action_smooth_buffers_for_term(env, current, prev, buffer_key)
+    second_diff = _sanitize_action_delta(current - 2 * prev_buffer + prev_prev_buffer, clamp_value=clamp_value)
+    reward = torch.sum(torch.square(second_diff), dim=1)
+
+    env._action_smooth_prev_prev_by_term[buffer_key] = prev_buffer.clone()
+    env._action_smooth_prev_by_term[buffer_key] = current.clone()
+    return reward
+
+
+def action_smooth_for_term_indices_safe(
+    env: ManagerBasedRLEnv,
+    action_name: str,
+    action_indices: Sequence[int],
+    clamp_value: float = 5.0,
+    scale_with_term: bool = False,
+) -> torch.Tensor:
+    """Reset-safe second-order smoothness penalty for selected dimensions of one action term."""
+    current, prev = _get_action_term_history(env, action_name=action_name, scale_with_term=scale_with_term)
+    if current is None or prev is None:
+        return torch.zeros(env.num_envs, device=env.action_manager.action.device)
+
+    indices = tuple(int(index) for index in action_indices)
+    if len(indices) == 0:
+        return torch.zeros(env.num_envs, device=current.device)
+    if min(indices) < 0 or max(indices) >= current.shape[1]:
+        raise ValueError(
+            f"Action indices {indices} are out of range for action term '{action_name}' "
+            f"with dimension {current.shape[1]}."
+        )
+
+    index_tensor = torch.tensor(indices, device=current.device, dtype=torch.long)
+    current = current.index_select(1, index_tensor)
+    prev = prev.index_select(1, index_tensor)
+
+    buffer_key = f"{action_name}:{indices}:{'scaled' if scale_with_term else 'raw'}"
+    prev_buffer, prev_prev_buffer = _prepare_action_smooth_buffers_for_term(env, current, prev, buffer_key)
+    second_diff = _sanitize_action_delta(current - 2 * prev_buffer + prev_prev_buffer, clamp_value=clamp_value)
+    reward = torch.sum(torch.square(second_diff), dim=1)
+
+    env._action_smooth_prev_prev_by_term[buffer_key] = prev_buffer.clone()
+    env._action_smooth_prev_by_term[buffer_key] = current.clone()
+    return reward
 
 
 def opposite_base_vel(

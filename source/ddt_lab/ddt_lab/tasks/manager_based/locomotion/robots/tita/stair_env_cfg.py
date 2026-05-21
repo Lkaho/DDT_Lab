@@ -15,7 +15,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 import ddt_lab.tasks.manager_based.locomotion.mdp as mdp
 
 from .rough_env_cfg import CommandsCfg as RoughCommandsCfg
-from .rough_env_cfg import EventCfg, RewardsCfg, TitaRoughEnvCfg
+from .rough_env_cfg import EventCfg, RewardsCfg, TitaRoughEnvCfg, configure_forward_only_play_commands
 from .rough_env_cfg import TerminationsCfg as RoughTerminationsCfg
 
 
@@ -32,12 +32,18 @@ STAIR_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     curriculum=True,
     sub_terrains={
         "stairs_down": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
-            proportion=0.55,
-            step_height_range=(0.04, 0.10),
+            proportion=0.40,
+            step_height_range=(0.08, 0.15),
             step_width=0.6,
             platform_width=2.5,
             border_width=0.0,
             holes=False,
+        ),
+        "smooth_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+            proportion=0.15,
+            slope_range=(0.0, 0.3),
+            platform_width=2.0,
+            border_width=0.25,
         ),
         "discrete_obstacles": terrain_gen.MeshRandomGridTerrainCfg(
             proportion=0.15,
@@ -55,6 +61,56 @@ STAIR_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     },
 )
 
+
+# STAIR_PLAY_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
+#     size=(8.0, 8.0),
+#     border_width=20.0,
+#     num_rows=6,
+#     num_cols=6,
+#     horizontal_scale=0.1,
+#     vertical_scale=0.005,
+#     slope_threshold=0.75,
+#     difficulty_range=(0.0, 1.0),
+#     use_cache=False,
+#     curriculum=False,
+#     sub_terrains={
+#         "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.15),
+#         "smooth_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+#             proportion=0.15,
+#             slope_range=(0.0, 0.3),
+#             platform_width=2.0,
+#             border_width=0.25,
+#         ),
+#         "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+#             proportion=0.15,
+#             noise_range=(0.01, 0.05),
+#             noise_step=0.02,
+#             border_width=0.25,
+#         ),
+#         "stairs_up": terrain_gen.MeshPyramidStairsTerrainCfg(
+#             proportion=0.25,
+#             step_height_range=(0.04, 0.1),
+#             step_width=0.45,
+#             platform_width=2.5,
+#             border_width=0.0,
+#             holes=False,
+#         ),
+#         "stairs_down": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+#             proportion=0.15,
+#             step_height_range=(0.04, 0.1),
+#             step_width=0.45,
+#             platform_width=2.5,
+#             border_width=0.0,
+#             holes=False,
+#         ),
+#         "discrete_obstacles": terrain_gen.MeshRandomGridTerrainCfg(
+#             proportion=0.15,
+#             grid_width=0.45,
+#             grid_height_range=(0.02, 0.10),
+#             platform_width=2.0,
+#         ),
+#     },
+# )
 
 STAIR_PLAY_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     size=(8.0, 8.0),
@@ -75,15 +131,9 @@ STAIR_PLAY_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
             platform_width=2.0,
             border_width=0.25,
         ),
-        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.15,
-            noise_range=(0.01, 0.05),
-            noise_step=0.02,
-            border_width=0.25,
-        ),
         "stairs_up": terrain_gen.MeshPyramidStairsTerrainCfg(
             proportion=0.25,
-            step_height_range=(0.04, 0.1),
+            step_height_range=(0.05, 0.12),
             step_width=0.45,
             platform_width=2.5,
             border_width=0.0,
@@ -91,17 +141,11 @@ STAIR_PLAY_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
         ),
         "stairs_down": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
             proportion=0.15,
-            step_height_range=(0.04, 0.1),
+            step_height_range=(0.05, 0.12),
             step_width=0.45,
             platform_width=2.5,
             border_width=0.0,
             holes=False,
-        ),
-        "discrete_obstacles": terrain_gen.MeshRandomGridTerrainCfg(
-            proportion=0.15,
-            grid_width=0.45,
-            grid_height_range=(0.02, 0.10),
-            platform_width=2.0,
         ),
     },
 )
@@ -188,6 +232,13 @@ class StairObservationsCfg:
     critic: CriticCfg = CriticCfg()
 
 
+# Stair estimator settings are centralized here so future tuning only needs this file.
+STAIR_ESTIMATOR_POLICY_HISTORY_LENGTH = 10
+STAIR_ESTIMATOR_WINDOW_LENGTH = 3
+STAIR_ESTIMATOR_OUTPUT_HISTORY_LENGTH = STAIR_ESTIMATOR_POLICY_HISTORY_LENGTH
+STAIR_ESTIMATOR_HISTORY_TERM_DIMS = (3, 3, 3, 6, 8, 8)
+
+
 @configclass
 class StairEstimatorObservationsCfg:
     """Observation specification for stair climbing with a velocity estimator."""
@@ -218,13 +269,13 @@ class StairEstimatorObservationsCfg:
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
-            self.history_length = 10
+            self.history_length = STAIR_ESTIMATOR_POLICY_HISTORY_LENGTH
 
     @configclass
     class HistoryCfg(PolicyCfg):
         def __post_init__(self):
             super().__post_init__()
-            self.history_length = 5
+            self.history_length = STAIR_ESTIMATOR_POLICY_HISTORY_LENGTH
 
     @configclass
     class CriticCfg(ObsGroup):
@@ -268,7 +319,7 @@ class StairEstimatorObservationsCfg:
 
     @configclass
     class PrivilegedCfg(ObsGroup):
-        base_lin_vel_xy = ObsTerm(func=mdp.base_lin_vel_xy, scale=2.0)
+        base_lin_vel_xy = ObsTerm(func=mdp.base_lin_vel_xy, scale=1.0)
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -282,12 +333,58 @@ class StairEstimatorObservationsCfg:
 
 
 @configclass
+class StairCENetObservationsCfg:
+    """DreamWaQ-style observations for stair climbing with CENet context estimation."""
+
+    @configclass
+    class PolicyCfg(StairEstimatorObservationsCfg.PolicyCfg):
+        def __post_init__(self):
+            super().__post_init__()
+            self.history_length = 1
+
+    @configclass
+    class HistoryCfg(PolicyCfg):
+        def __post_init__(self):
+            super().__post_init__()
+            self.history_length = 5
+
+    @configclass
+    class CriticCfg(StairEstimatorObservationsCfg.CriticCfg):
+        pass
+
+    @configclass
+    class PrivilegedCfg(ObsGroup):
+        base_lin_vel = ObsTerm(func=mdp.diag_base_lin_vel, scale=1.0)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+            self.history_length = 1
+
+    policy: PolicyCfg = PolicyCfg()
+    history: HistoryCfg = HistoryCfg()
+    critic: CriticCfg = CriticCfg()
+    privileged: PrivilegedCfg = PrivilegedCfg()
+
+
+@configclass
+class StairNoBaseVelObservationsCfg(StairObservationsCfg):
+    """Stair observations without actor-side ``base_lin_vel_xy`` and without a velocity estimator."""
+
+    @configclass
+    class PolicyCfg(StairObservationsCfg.PolicyCfg):
+        base_lin_vel_xy = None
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
 class StairActionsCfg:
     """Action specification with contact-triggered feedforward trajectory."""
 
-    joint_pos = mdp.JointPositionWithFeedforwardActionCfg(
+    joint_pos = mdp.TitaJointPositionEffortActionCfg(
         asset_name="robot",
-        joint_names=[
+        leg_joint_names=[
             "joint_left_leg_1",
             "joint_left_leg_2",
             "joint_left_leg_3",
@@ -295,8 +392,12 @@ class StairActionsCfg:
             "joint_right_leg_2",
             "joint_right_leg_3",
         ],
-        scale=0.25,
-        use_default_offset=True,
+        wheel_joint_names=["joint_left_leg_4", "joint_right_leg_4"],
+        leg_scale=(0.25, 0.5, 0.5, 0.25, 0.5, 0.5),
+        wheel_scale=0.5,
+        wheel_effort_gain=12.0,
+        wheel_offset=0.0,
+        use_default_leg_offset=True,
         preserve_order=True,
         clip={".*": (-100.0, 100.0)},
         feedforward_enabled=True,
@@ -305,7 +406,7 @@ class StairActionsCfg:
         feedforward_period=0.6,
         feedforward_amplitude={
             ".*_leg_2": 0.4,
-            ".*_leg_3": -0.8,
+            ".*_leg_3": -0.80,
         },
         feedforward_joint_names=[
             "joint_left_leg_2",
@@ -320,17 +421,9 @@ class StairActionsCfg:
         followup_trigger_delay_factor=0.0,
         k_ff_anneal_enabled=True,
         k_ff_final=0.0,
-        k_ff_start_iteration=10000,
-        k_ff_anneal_iterations=30000,
+        k_ff_start_iteration=20000,
+        k_ff_anneal_iterations=10000,
         k_ff_steps_per_iteration=24,
-    )
-    joint_vel = mdp.JointVelocityActionCfg(
-        asset_name="robot",
-        joint_names=["joint_left_leg_4", "joint_right_leg_4"],
-        scale=5.0,
-        use_default_offset=True,
-        preserve_order=True,
-        clip={".*": (-100.0, 100.0)},
     )
 
 
@@ -346,7 +439,7 @@ class StairCommandsCfg(RoughCommandsCfg):
     base_velocity = mdp.TerrainAwareUniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.1,
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.5,
@@ -381,59 +474,69 @@ class StairRewardsCfg(RewardsCfg):
     # ---------------------------------------------------------------------
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_exp,
-        weight=5.0,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
-    )
-    track_ang_vel_z_exp = RewTerm(
-        func=mdp.track_ang_vel_z_exp,
         weight=3.0,
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
-    track_heading_exp = RewTerm(
-        func=mdp.track_heading_exp,
-        weight=2.0,
+
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_exp,
+        weight=2.5,
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
+
+    track_heading_exp = RewTerm(
+        func=mdp.track_heading_exp,
+        weight=0.5,
+        params={
+            "command_name": "base_velocity",
+            "std": math.sqrt(0.25),
+        },
+    )
+
     stand_still = RewTerm(
         func=mdp.stand_still,
-        weight=-1.0,
+        weight=-0.5,
         params={
             "command_name": "base_velocity",
             "command_threshold": 0.1,
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"]),
         },
     )
     feet_air_time = RewTerm(
         func=mdp.feet_air_time,
-        weight=0.2,
+        weight=1.0,
         params={
             "command_name": "base_velocity",
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
-            "threshold": 0.2,
+            "threshold": 0.1,
         },
     )
     feet_height = RewTerm(
-        func=mdp.feet_height_relative,
-        weight=-0.5,
+        func=mdp.feet_height_band_relative,
+        weight=1.0,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_leg_4"]),
             "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "target_height": 0.15,
+            "target_height": 0.12,
+            "std": 0.05,
             "tanh_mult": 2.0,
+            "wheel_radius": 0.0925,
+            "action_name": "joint_pos",
         },
     )
     feet_contact_number = RewTerm(
         func=mdp.feet_contact_number,
-        weight=2.0,
+        weight=1.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
             "mismatch_penalty": 1.3,
+            "contact_threshold": 5.0,
         },
     )
     tracking_target_pos = RewTerm(
         func=mdp.track_ff_target_pos_exp,
-        weight=0.5,
+        weight=1.0,
         params={
             "action_name": "joint_pos",
             "asset_cfg": SceneEntityCfg("robot"),
@@ -444,17 +547,29 @@ class StairRewardsCfg(RewardsCfg):
     # ---------------------------------------------------------------------
     # Style rewards
     # ---------------------------------------------------------------------
-    joint_pos_penalty = RewTerm(
-        func=mdp.joint_pos_penalty,
-        weight=-0.5,
+    # joint_deviation_no_lift = RewTerm(
+    #     func=mdp.joint_deviation_l2_no_lift,
+    #     weight=-1.0,
+    #     params={
+    #         "command_name": "base_velocity",
+    #         "command_threshold": 0.1,
+    #         "action_name": "joint_pos",
+    #         "asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"]),
+    #     },
+    # )
+
+    # joint_deviation_legs_l1 = None
+
+    joint_mirror = RewTerm(
+        func=mdp.joint_mirror,
+        weight=-0.1,
         params={
-            "command_name": "base_velocity",
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"]),
-            "stand_still_scale": 5.0,
-            "velocity_threshold": 100.0,
-            "command_threshold": 0.15,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "mirror_joints": [["joint_left_leg_(1|2|3)", "joint_right_leg_(1|2|3)"]],
         },
     )
+    # joint_mirror = None
+
     wheel_vel_penalty = RewTerm(
         func=mdp.wheel_vel_penalty,
         weight=-0.01,
@@ -466,37 +581,64 @@ class StairRewardsCfg(RewardsCfg):
             "command_threshold": 0.1,
         },
     )
-    feet_x_symmetry = RewTerm(
-        func=mdp.feet_x_symmetry,
-        weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=[".*_leg_4"])},
-    )
+
+    # wheel_spin = RewTerm(
+    #     func=mdp.wheel_spin_penalty,
+    #     weight=-1.0,
+    #     params={
+    #         "wheel_joint_cfg": SceneEntityCfg(
+    #             "robot", joint_names=["joint_left_leg_4", "joint_right_leg_4"]
+    #         ),
+    #         "foot_body_cfg": SceneEntityCfg("robot", body_names=["left_leg_4", "right_leg_4"]),
+    #         "wheel_radius": 0.0925,
+    #         "spin_scale": 0.8,
+    #         "slip_deadband": 0.1,
+    #     },
+    # )
+
     feet_y_distance = RewTerm(
         func=mdp.feet_y_distance,
         weight=-2.0,
         params={
-            "min_distance": 0.4,
-            "max_distance": 0.8,
+            "min_distance": 0.5,
+            "max_distance": 0.62,
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_leg_4"]),
         },
     )
-    joint_deviation_hip_roll_l1 = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.5,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_1"])},
-    )
+
     base_height_l2 = RewTerm(
         func=mdp.base_height_l2,
-        weight=-20.0,
+        weight=-40.0,
         params={"target_height": 0.35, "sensor_cfg": SceneEntityCfg("height_scanner")},
     )
+
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-12.0)
 
     # ---------------------------------------------------------------------
     # Regularization rewards
     # ---------------------------------------------------------------------
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2_safe, weight=-0.01, params={"clamp_value": 5.0})
-    action_smooth = RewTerm(func=mdp.action_smooth_safe, weight=-0.01, params={"clamp_value": 5.0})
+    action_smooth = RewTerm(
+        func=mdp.action_smooth_for_term_indices_safe,
+        weight=-0.01,
+        params={
+            "action_name": "joint_pos",
+            "action_indices": [3, 7],
+            "clamp_value": 5.0,
+            "scale_with_term": False,
+        },
+    )
+
+    zero_command_wheel_vel = RewTerm(
+        func=mdp.zero_command_wheel_vel_l1,
+        weight=-0.02,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.15,
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+        },
+    )
+
     opposite_base_vel = RewTerm(
         func=mdp.opposite_base_vel,
         weight=-40.0,
@@ -510,7 +652,6 @@ class StairRewardsCfg(RewardsCfg):
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
         },
     )
-
 
 @configclass
 class StairCurriculumCfg:
@@ -555,10 +696,10 @@ class TitaStairBaseEnvCfg(TitaRoughEnvCfg):
 
         self.commands.base_velocity.heading_command = True
         self.commands.base_velocity.rel_heading_envs = 1.0
-        self.commands.base_velocity.rel_standing_envs = 0.02
+        self.commands.base_velocity.rel_standing_envs = 0.1
         self.commands.base_velocity.align_heading_with_robot_on_reset = True
         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (-math.pi / 4.0, math.pi / 4.0)
         self.commands.base_velocity.restricted_lin_vel_x_range = (0.0, 1.0)
@@ -593,6 +734,7 @@ class TitaStairNoEstimatorEnvCfg_PLAY(TitaStairNoEstimatorEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        configure_forward_only_play_commands(self)
 
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
@@ -616,11 +758,26 @@ class TitaStairEnvCfg(TitaStairBaseEnvCfg):
 
 
 @configclass
+class TitaStairNoBaseVelEnvCfg(TitaStairBaseEnvCfg):
+    """Tita stair-climbing environment without base_lin_vel_xy and without velocity estimation."""
+
+    observations: StairNoBaseVelObservationsCfg = StairNoBaseVelObservationsCfg()
+
+
+@configclass
+class TitaStairCENetEnvCfg(TitaStairBaseEnvCfg):
+    """Tita stair-climbing environment with CENet context estimation for AdaBoot."""
+
+    observations: StairCENetObservationsCfg = StairCENetObservationsCfg()
+
+
+@configclass
 class TitaStairEnvCfg_PLAY(TitaStairEnvCfg):
     """Play configuration for the stair-climbing environment."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        configure_forward_only_play_commands(self)
 
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
@@ -628,6 +785,51 @@ class TitaStairEnvCfg_PLAY(TitaStairEnvCfg):
         self.scene.terrain.terrain_generator = STAIR_PLAY_TERRAINS_CFG
         self.observations.policy.enable_corruption = False
         self.observations.history.enable_corruption = False
+
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        self.events.add_base_inertia = None
+        self.events.add_base_com = None
+        self.events.add_base_mass = None
+        self.events.randomize_actuator_gains = None
+
+
+@configclass
+class TitaStairCENetEnvCfg_PLAY(TitaStairCENetEnvCfg):
+    """Play configuration for the CENet stair-climbing environment."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        configure_forward_only_play_commands(self)
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.scene.terrain.max_init_terrain_level = None
+        self.scene.terrain.terrain_generator = STAIR_PLAY_TERRAINS_CFG
+        self.observations.policy.enable_corruption = False
+        self.observations.history.enable_corruption = False
+
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        self.events.add_base_inertia = None
+        self.events.add_base_com = None
+        self.events.add_base_mass = None
+        self.events.randomize_actuator_gains = None
+
+
+@configclass
+class TitaStairNoBaseVelEnvCfg_PLAY(TitaStairNoBaseVelEnvCfg):
+    """Play configuration for the stair no-base-velocity environment without estimator."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        configure_forward_only_play_commands(self)
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.scene.terrain.max_init_terrain_level = None
+        self.scene.terrain.terrain_generator = STAIR_PLAY_TERRAINS_CFG
+        self.observations.policy.enable_corruption = False
 
         self.events.base_external_force_torque = None
         self.events.push_robot = None

@@ -8,7 +8,17 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 import sys
+
+
+def _prefer_local_source_tree() -> None:
+    repo_source_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "source", "ddt_lab"))
+    if repo_source_dir not in sys.path:
+        sys.path.insert(0, repo_source_dir)
+
+
+_prefer_local_source_tree()
 
 from isaaclab.app import AppLauncher
 
@@ -78,7 +88,8 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 """Rest everything follows."""
 
-import os
+_prefer_local_source_tree()
+
 import re
 from datetime import datetime
 
@@ -205,7 +216,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     joint_pos_term = None
     if "joint_pos" in env.unwrapped.action_manager.active_terms:
-        joint_pos_term = env.unwrapped.action_manager.get_term("joint_pos")
+        candidate_joint_pos_term = env.unwrapped.action_manager.get_term("joint_pos")
+        if getattr(candidate_joint_pos_term.cfg, "feedforward_enabled", False):
+            joint_pos_term = candidate_joint_pos_term
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":

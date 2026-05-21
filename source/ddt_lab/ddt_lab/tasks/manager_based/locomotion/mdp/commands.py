@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,6 +13,69 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+class ResetAwareUniformVelocityCommand(UniformVelocityCommand):
+    """Uniform velocity command that can be sampled before reset events run.
+
+    ManagerBasedRLEnv applies reset events before ``command_manager.reset()``. This command lets
+    reset events pre-sample the command so reset logic can use the same standing-env mask that will
+    remain active for the new episode.
+    """
+
+    cfg: "ResetAwareUniformVelocityCommandCfg"
+
+    def __init__(self, cfg: "ResetAwareUniformVelocityCommandCfg", env: "ManagerBasedEnv"):
+        super().__init__(cfg, env)
+        self._presampled_reset_envs = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def _resolve_env_ids(self, env_ids: Sequence[int] | slice | None) -> torch.Tensor:
+        if env_ids is None:
+            return torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        if isinstance(env_ids, slice):
+            return torch.arange(self.num_envs, device=self.device, dtype=torch.long)[env_ids]
+        return torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+
+    def presample_for_reset(self, env_ids: Sequence[int] | slice | None = None) -> None:
+        """Sample commands early so reset events can read ``is_standing_env`` for this episode."""
+        env_ids_tensor = self._resolve_env_ids(env_ids)
+        if env_ids_tensor.numel() == 0:
+            return
+
+        self.command_counter[env_ids_tensor] = 0
+        self._resample(env_ids_tensor)
+        self._update_command()
+        self._presampled_reset_envs[env_ids_tensor] = True
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        """Reset metrics while preserving commands that were pre-sampled by reset events."""
+        env_ids_tensor = self._resolve_env_ids(env_ids)
+        env_ids_index = slice(None) if env_ids is None else env_ids_tensor
+
+        extras = {}
+        for metric_name, metric_value in self.metrics.items():
+            extras[metric_name] = torch.mean(metric_value[env_ids_index]).item()
+            metric_value[env_ids_index] = 0.0
+
+        if env_ids_tensor.numel() == 0:
+            return extras
+
+        presampled_mask = self._presampled_reset_envs[env_ids_tensor]
+        resample_env_ids = env_ids_tensor[~presampled_mask]
+        if resample_env_ids.numel() > 0:
+            self.command_counter[resample_env_ids] = 0
+            self._resample(resample_env_ids)
+
+        self._update_command()
+        self._presampled_reset_envs[env_ids_tensor] = False
+        return extras
+
+
+@configclass
+class ResetAwareUniformVelocityCommandCfg(UniformVelocityCommandCfg):
+    """Configuration for reset-aware uniform velocity commands."""
+
+    class_type: type = ResetAwareUniformVelocityCommand
+
+
 class TerrainAwareUniformVelocityCommand(UniformVelocityCommand):
     """Uniform velocity command with terrain-dependent axis filtering."""
 
@@ -19,7 +83,49 @@ class TerrainAwareUniformVelocityCommand(UniformVelocityCommand):
 
     def __init__(self, cfg: "TerrainAwareUniformVelocityCommandCfg", env: "ManagerBasedEnv"):
         super().__init__(cfg, env)
+        self._presampled_reset_envs = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._restricted_terrain_types = self._resolve_restricted_terrain_types()
+
+    def _resolve_env_ids(self, env_ids: Sequence[int] | slice | None) -> torch.Tensor:
+        if env_ids is None:
+            return torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        if isinstance(env_ids, slice):
+            return torch.arange(self.num_envs, device=self.device, dtype=torch.long)[env_ids]
+        return torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+
+    def presample_for_reset(self, env_ids: Sequence[int] | slice | None = None) -> None:
+        """Sample commands early so reset events can read ``is_standing_env`` for this episode."""
+        env_ids_tensor = self._resolve_env_ids(env_ids)
+        if env_ids_tensor.numel() == 0:
+            return
+
+        self.command_counter[env_ids_tensor] = 0
+        self._resample(env_ids_tensor)
+        self._update_command()
+        self._presampled_reset_envs[env_ids_tensor] = True
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        """Reset metrics while preserving commands that were pre-sampled by reset events."""
+        env_ids_tensor = self._resolve_env_ids(env_ids)
+        env_ids_index = slice(None) if env_ids is None else env_ids_tensor
+
+        extras = {}
+        for metric_name, metric_value in self.metrics.items():
+            extras[metric_name] = torch.mean(metric_value[env_ids_index]).item()
+            metric_value[env_ids_index] = 0.0
+
+        if env_ids_tensor.numel() == 0:
+            return extras
+
+        presampled_mask = self._presampled_reset_envs[env_ids_tensor]
+        resample_env_ids = env_ids_tensor[~presampled_mask]
+        if resample_env_ids.numel() > 0:
+            self.command_counter[resample_env_ids] = 0
+            self._resample(resample_env_ids)
+
+        self._update_command()
+        self._presampled_reset_envs[env_ids_tensor] = False
+        return extras
 
     def _resample_command(self, env_ids):
         super()._resample_command(env_ids)

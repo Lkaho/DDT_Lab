@@ -51,25 +51,6 @@ gym.register(
     },
 )
 
-gym.register(
-    id="DDT-Velocity-Stair-Tita-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairEstimatorPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="DDT-Velocity-Stair-Tita-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairEstimatorPPORunnerCfg",
-    },
-)
 
 gym.register(
     id="DDT-Velocity-Stair-Tita-Estimator-v0",
@@ -111,6 +92,46 @@ gym.register(
     },
 )
 
+gym.register(
+    id="DDT-Velocity-Stair-Tita-CENet-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": stair_env_cfg.TitaStairCENetEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairCENetAdaBootPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="DDT-Velocity-Stair-Tita-CENet-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": stair_env_cfg.TitaStairCENetEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairCENetAdaBootPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="DDT-Velocity-Stair-Tita-NoBaseVel-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": stair_env_cfg.TitaStairNoBaseVelEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="DDT-Velocity-Stair-Tita-NoBaseVel-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": stair_env_cfg.TitaStairNoBaseVelEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairPPORunnerCfg",
+    },
+)
+
 ##
 # Register environments without base_lin_vel_xy observation
 ##
@@ -126,6 +147,16 @@ gym.register(
 )
 
 gym.register(
+    id="DDT-Velocity-Flat-Tita-NoBaseVel-NoEstimator-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": no_base_vel_env_cfg.TitaFlatNoBaseVelNoEstimatorEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatNoBaseVelPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="DDT-Velocity-Flat-Tita-NoBaseVel-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -136,21 +167,11 @@ gym.register(
 )
 
 gym.register(
-    id="DDT-Velocity-Rough-Tita-NoBaseVel-v0",
+    id="DDT-Velocity-Flat-Tita-NoBaseVel-NoEstimator-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": no_base_vel_env_cfg.TitaRoughNoBaseVelEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaRoughNoBaseVelEstimatorPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="DDT-Velocity-Rough-Tita-NoBaseVel-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": no_base_vel_env_cfg.TitaRoughNoBaseVelEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaRoughNoBaseVelEstimatorPPORunnerCfg",
+        "env_cfg_entry_point": no_base_vel_env_cfg.TitaFlatNoBaseVelNoEstimatorEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatNoBaseVelPPORunnerCfg",
     },
 )

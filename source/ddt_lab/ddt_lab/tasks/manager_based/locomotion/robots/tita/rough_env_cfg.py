@@ -90,7 +90,7 @@ class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.1,
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.5,
@@ -105,29 +105,24 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos_0 = mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=["joint_left_leg_1"], scale=0.25, use_default_offset=True
-    )
-    joint_pos_1 = mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=["joint_left_leg_2"], scale=0.25, use_default_offset=True
-    )
-    joint_pos_2 = mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=["joint_left_leg_3"], scale=0.25, use_default_offset=True
-    )
-    joint_vel_3 = mdp.JointVelocityActionCfg(
-        asset_name="robot", joint_names=["joint_left_leg_4"], scale=5.0, use_default_offset=True
-    )
-    joint_pos_4 = mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=["joint_right_leg_1"], scale=0.25, use_default_offset=True
-    )
-    joint_pos_5 = mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=["joint_right_leg_2"], scale=0.25, use_default_offset=True
-    )
-    joint_pos_6 = mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=["joint_right_leg_3"], scale=0.25, use_default_offset=True
-    )
-    joint_vel_7 = mdp.JointVelocityActionCfg(
-        asset_name="robot", joint_names=["joint_right_leg_4"], scale=5.0, use_default_offset=True
+    joint_pos = mdp.TitaJointPositionEffortActionCfg(
+        asset_name="robot",
+        leg_joint_names=[
+            "joint_left_leg_1",
+            "joint_left_leg_2",
+            "joint_left_leg_3",
+            "joint_right_leg_1",
+            "joint_right_leg_2",
+            "joint_right_leg_3",
+        ],
+        wheel_joint_names=["joint_left_leg_4", "joint_right_leg_4"],
+        leg_scale=(0.25, 0.5, 0.5, 0.25, 0.5, 0.5),
+        wheel_scale=0.5,
+        wheel_effort_gain=12.0,
+        wheel_offset=0.0,
+        use_default_leg_offset=True,
+        preserve_order=True,
+        feedforward_enabled=False,
     )
 
 
@@ -291,21 +286,36 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
-    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
+    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=3.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
+    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_exp, weight=2.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
-    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.5)
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    action_smooth = RewTerm(
+        func=mdp.action_smooth_for_term_indices_safe,
+        weight=-0.01,
+        params={
+            "action_name": "joint_pos",
+            "action_indices": [3, 7],
+            "clamp_value": 5.0,
+            "scale_with_term": False,
+        },
+    )
     joint_mirror = RewTerm(
         func=mdp.joint_mirror,
-        weight=-0.05,
+        weight=-0.5,
         params={"asset_cfg": SceneEntityCfg("robot"), "mirror_joints": [["joint_left_leg_(1|2|3)", "joint_right_leg_(1|2|3)"]]},
+    )
+    joint_deviation_legs_l1 = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-2.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[1]"])},
     )
     stand_still = RewTerm(
         func=mdp.stand_still,
-        weight=0.0,
+        weight=-0.1,
         params={"command_name": "base_velocity", "command_threshold": 0.1, "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"])},
     )
     undesired_contacts = RewTerm(
@@ -313,8 +323,8 @@ class RewardsCfg:
         weight=-10.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_2", ".*_leg_3"]), "threshold": 1.0},
     )
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
-    base_height_l2 = RewTerm(func=mdp.base_height_l2, weight=-10.0, params={"target_height": 0.3})
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-40.0)
+    base_height_l2 = RewTerm(func=mdp.base_height_l2, weight=-50.0, params={"target_height": 0.33})
 
 
 @configclass
@@ -370,10 +380,21 @@ class TitaRoughEnvCfg(ManagerBasedRLEnvCfg):
                 self.scene.terrain.terrain_generator.curriculum = False
 
 
+def configure_forward_only_play_commands(env_cfg, lin_vel_x_range: tuple[float, float] = (0.0, 1.0)) -> None:
+    """Configure play-mode velocity commands to sample only forward motion."""
+    base_velocity = env_cfg.commands.base_velocity
+    base_velocity.rel_standing_envs = 0.0
+    base_velocity.ranges.lin_vel_x = lin_vel_x_range
+    base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+    if hasattr(base_velocity, "restricted_lin_vel_x_range"):
+        base_velocity.restricted_lin_vel_x_range = lin_vel_x_range
+
+
 @configclass
 class TitaRoughEnvCfg_PLAY(TitaRoughEnvCfg):
     def __post_init__(self):
         super().__post_init__()
+        configure_forward_only_play_commands(self)
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
         self.scene.terrain.max_init_terrain_level = None
