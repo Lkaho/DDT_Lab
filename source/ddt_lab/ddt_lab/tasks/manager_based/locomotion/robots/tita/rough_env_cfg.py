@@ -286,7 +286,7 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=3.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
+    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=3.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
     track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_exp, weight=2.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.5)
@@ -311,7 +311,7 @@ class RewardsCfg:
     joint_deviation_legs_l1 = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-2.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[1]"])},
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"])},
     )
     stand_still = RewTerm(
         func=mdp.stand_still,
@@ -323,8 +323,8 @@ class RewardsCfg:
         weight=-10.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_2", ".*_leg_3"]), "threshold": 1.0},
     )
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-40.0)
-    base_height_l2 = RewTerm(func=mdp.base_height_l2, weight=-50.0, params={"target_height": 0.33})
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-20.0)
+    base_height_l2 = RewTerm(func=mdp.base_height_l2, weight=-10.0, params={"target_height": 0.33})
 
 
 @configclass
@@ -357,6 +357,7 @@ class TitaRoughEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
+    only_positive_rewards: bool = False
 
     def __post_init__(self):
         self.decimation = 4

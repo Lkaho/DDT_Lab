@@ -154,6 +154,12 @@ def _max_obs_group_abs(obs_timestep, env_idx: int, group_names: list[str]) -> tu
     return best_name, best_abs
 
 
+def _resolve_velocity_target_groups(obs_groups) -> list[str]:
+    if "velocity_target" in obs_groups:
+        return obs_groups["velocity_target"]
+    return obs_groups.get("privileged", [])
+
+
 class DiagnosticActorCritic(ActorCritic):
     """Default actor-critic with light-weight observation sanitization and diagnostics."""
 
@@ -354,15 +360,15 @@ class ActorCriticWithEstimator(nn.Module):
         self.estimator_lr = estimator_lr
 
         self._history_groups = obs_groups.get("history", obs_groups["policy"])
-        self._privileged_groups = obs_groups.get("privileged", [])
+        self._velocity_target_groups = _resolve_velocity_target_groups(obs_groups)
 
         num_actor_obs = sum(obs[group_name].shape[-1] for group_name in obs_groups["policy"])
         num_history_obs = sum(obs[group_name].shape[-1] for group_name in self._history_groups)
         num_critic_obs = sum(obs[group_name].shape[-1] for group_name in obs_groups["critic"])
         if estimator_output_dim is None:
-            estimator_output_dim = sum(obs[group_name].shape[-1] for group_name in self._privileged_groups)
+            estimator_output_dim = sum(obs[group_name].shape[-1] for group_name in self._velocity_target_groups)
         if estimator_output_dim <= 0:
-            raise ValueError("ActorCriticWithEstimator requires a non-empty privileged observation target.")
+            raise ValueError("ActorCriticWithEstimator requires a non-empty velocity_target observation group.")
         if self.num_history < 1:
             raise ValueError("num_history must be greater than or equal to 1.")
         if self.estimated_history_length < 1:
@@ -491,6 +497,10 @@ class ActorCriticWithEstimator(nn.Module):
     def estimated_velocity(self):
         return self._last_estimated_velocity
 
+    @property
+    def velocity_target_groups(self) -> list[str]:
+        return self._velocity_target_groups
+
     @staticmethod
     def _build_scale_tensor(
         scale: float | list[float] | tuple[float, ...],
@@ -519,7 +529,7 @@ class ActorCriticWithEstimator(nn.Module):
         return torch.where(active, unscaled, torch.zeros_like(unscaled))
 
     def _unscale_estimator_targets(self, target: torch.Tensor) -> torch.Tensor:
-        # Keep the estimator supervised in physical velocity units even if the privileged obs is configured scaled.
+        # Keep the estimator supervised in physical velocity units even if the target obs is configured scaled.
         return target / self._estimator_target_scale.to(device=target.device, dtype=target.dtype)
 
     def _concat_obs(self, obs, group_names: list[str], set_name: str = "obs") -> torch.Tensor:
@@ -612,7 +622,7 @@ class ActorCriticWithEstimator(nn.Module):
         return self._frame_major_to_term_major_history(window)
 
     def _estimate_current_from_history(self, history_obs: torch.Tensor) -> torch.Tensor:
-        """Estimate only the current privileged target from the most recent num_history raw frames."""
+        """Estimate only the current velocity target from the most recent num_history raw frames."""
         if self.history_term_dims is None:
             return self.estimator(history_obs)
 
@@ -664,7 +674,8 @@ class ActorCriticWithEstimator(nn.Module):
         return history.reshape(current_estimate.shape[0], -1)
 
     def get_estimator_targets(self, obs) -> torch.Tensor:
-        return self._unscale_estimator_targets(self._concat_obs(obs, self._privileged_groups, set_name="privileged"))
+        target_obs = self._concat_obs(obs, self._velocity_target_groups, set_name="velocity_target")
+        return self._unscale_estimator_targets(target_obs)
 
     def get_actor_obs(
         self,
@@ -1191,18 +1202,18 @@ class ActorCriticWithCENet(nn.Module):
         self.obs_groups = obs_groups
         self.num_history = num_history
         self._history_groups = obs_groups.get("history", obs_groups["policy"])
-        self._privileged_groups = obs_groups.get("privileged", [])
-        if not self._privileged_groups:
-            raise ValueError("ActorCriticWithCENet requires a privileged observation target.")
+        self._velocity_target_groups = _resolve_velocity_target_groups(obs_groups)
+        if not self._velocity_target_groups:
+            raise ValueError("ActorCriticWithCENet requires a velocity_target observation group.")
 
         num_actor_obs = sum(obs[group_name].shape[-1] for group_name in obs_groups["policy"])
         num_history_obs = sum(obs[group_name].shape[-1] for group_name in self._history_groups)
         num_critic_obs = sum(obs[group_name].shape[-1] for group_name in obs_groups["critic"])
-        num_privileged_obs = sum(obs[group_name].shape[-1] for group_name in self._privileged_groups)
-        if num_privileged_obs != cenet_velocity_dim:
+        num_velocity_target_obs = sum(obs[group_name].shape[-1] for group_name in self._velocity_target_groups)
+        if num_velocity_target_obs != cenet_velocity_dim:
             raise ValueError(
-                "ActorCriticWithCENet expects privileged targets to match cenet_velocity_dim. "
-                f"Expected {cenet_velocity_dim}, got {num_privileged_obs}."
+                "ActorCriticWithCENet expects velocity_target observations to match cenet_velocity_dim. "
+                f"Expected {cenet_velocity_dim}, got {num_velocity_target_obs}."
             )
 
         encoder_output_dim = int(cenet_encoder_hidden_dims[-1])
@@ -1274,6 +1285,18 @@ class ActorCriticWithCENet(nn.Module):
     def estimated_velocity(self):
         return self._last_estimated_velocity
 
+    @property
+    def velocity_target_groups(self) -> list[str]:
+        return self._velocity_target_groups
+
+    def cenet_parameters(self):
+        yield from self.cenet_encoder.parameters()
+        yield from self.cenet_mean_vel.parameters()
+        yield from self.cenet_logvar_vel.parameters()
+        yield from self.cenet_mean_latent.parameters()
+        yield from self.cenet_logvar_latent.parameters()
+        yield from self.cenet_decoder.parameters()
+
     def reset(self, dones=None):
         pass
 
@@ -1297,7 +1320,7 @@ class ActorCriticWithCENet(nn.Module):
         return self._concat_obs(obs, self._history_groups, set_name="history")
 
     def get_velocity_targets(self, obs) -> torch.Tensor:
-        return self._concat_obs(obs, self._privileged_groups, set_name="privileged")
+        return self._concat_obs(obs, self._velocity_target_groups, set_name="velocity_target")
 
     def get_critic_obs(self, obs) -> torch.Tensor:
         return self._concat_obs(obs, self.obs_groups["critic"], set_name="critic")
@@ -1309,7 +1332,16 @@ class ActorCriticWithCENet(nn.Module):
         std = torch.exp(0.5 * logvar)
         return mean + std * torch.randn_like(std)
 
-    def cenet_forward(self, history_obs: torch.Tensor, sample: bool = True) -> dict[str, torch.Tensor]:
+    def decode_cenet(self, latent_code: torch.Tensor, velocity_code: torch.Tensor) -> torch.Tensor:
+        decoder_input = torch.cat([velocity_code, latent_code], dim=-1)
+        return self.cenet_decoder(decoder_input)
+
+    def cenet_forward(
+        self,
+        history_obs: torch.Tensor,
+        sample: bool = True,
+        reconstruction_velocity: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         encoded = self.cenet_encoder(history_obs)
         mean_vel = self.cenet_mean_vel(encoded)
         logvar_vel = torch.clamp(self.cenet_logvar_vel(encoded), min=-10.0, max=5.0)
@@ -1318,7 +1350,12 @@ class ActorCriticWithCENet(nn.Module):
         code_vel = self._reparameterize(mean_vel, logvar_vel, sample=sample)
         code_latent = self._reparameterize(mean_latent, logvar_latent, sample=sample)
         code = torch.cat([code_vel, code_latent], dim=-1)
-        reconstruction = self.cenet_decoder(code)
+        decoder_velocity = (
+            code_vel
+            if reconstruction_velocity is None
+            else reconstruction_velocity.to(device=code_latent.device, dtype=code_latent.dtype)
+        )
+        reconstruction = self.decode_cenet(code_latent, decoder_velocity)
         self._last_estimated_velocity = mean_vel
         return {
             "code": code,
@@ -1335,15 +1372,19 @@ class ActorCriticWithCENet(nn.Module):
         self,
         obs,
         bootstrap_mask: torch.Tensor | None = None,
-        sample_cenet: bool = True,
+        sample_cenet: bool = False,
         true_velocity: torch.Tensor | None = None,
+        detach_cenet: bool = False,
+        actor_velocity_code: torch.Tensor | None = None,
     ) -> torch.Tensor:
         policy_obs = self.get_policy_obs(obs)
         history_obs = self.get_history_obs(obs)
         cenet_outputs = self.cenet_forward(history_obs, sample=sample_cenet)
 
-        estimated_velocity = cenet_outputs["code_vel"] if sample_cenet else cenet_outputs["mean_vel"]
-        if bootstrap_mask is not None:
+        estimated_velocity = cenet_outputs["code_vel"]
+        if actor_velocity_code is not None:
+            velocity_code = actor_velocity_code.to(device=estimated_velocity.device, dtype=estimated_velocity.dtype)
+        elif bootstrap_mask is not None:
             if true_velocity is None:
                 true_velocity = self.get_velocity_targets(obs).detach()
             mask = bootstrap_mask.reshape(-1, 1).to(device=estimated_velocity.device, dtype=torch.bool)
@@ -1351,7 +1392,13 @@ class ActorCriticWithCENet(nn.Module):
         else:
             velocity_code = estimated_velocity
 
-        return torch.cat([policy_obs, velocity_code, cenet_outputs["code_latent"]], dim=-1)
+        latent_code = cenet_outputs["code_latent"]
+        if detach_cenet:
+            velocity_code = velocity_code.detach()
+            latent_code = latent_code.detach()
+
+        self._last_actor_velocity_code = velocity_code.detach()
+        return torch.cat([policy_obs, velocity_code, latent_code], dim=-1)
 
     def update_distribution(self, obs):
         mean = self.actor(obs)
@@ -1363,8 +1410,25 @@ class ActorCriticWithCENet(nn.Module):
         _log_action_std_anomaly(self, std)
         self.distribution = Normal(mean, std)
 
-    def act(self, obs, bootstrap_mask: torch.Tensor | None = None, **kwargs):
-        obs = self.get_actor_obs(obs, bootstrap_mask=bootstrap_mask, sample_cenet=True)
+    @property
+    def last_actor_velocity_code(self) -> torch.Tensor | None:
+        return getattr(self, "_last_actor_velocity_code", None)
+
+    def act(
+        self,
+        obs,
+        bootstrap_mask: torch.Tensor | None = None,
+        detach_cenet: bool = False,
+        actor_velocity_code: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        obs = self.get_actor_obs(
+            obs,
+            bootstrap_mask=bootstrap_mask,
+            sample_cenet=False,
+            detach_cenet=detach_cenet,
+            actor_velocity_code=actor_velocity_code,
+        )
         obs = self.actor_obs_normalizer(obs)
         self.update_distribution(obs)
         return self.distribution.sample()
@@ -1398,9 +1462,9 @@ class ActorCriticWithCENet(nn.Module):
         dones: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         history_obs = self.get_history_obs(obs)
-        outputs = self.cenet_forward(history_obs, sample=True)
         velocity_target = self.get_velocity_targets(obs).detach()
-        velocity_loss = torch.nn.functional.mse_loss(outputs["mean_vel"], velocity_target)
+        outputs = self.cenet_forward(history_obs, sample=True, reconstruction_velocity=velocity_target)
+        velocity_loss = torch.nn.functional.mse_loss(outputs["code_vel"], velocity_target)
 
         valid = 1.0 - dones.reshape(-1, 1).float()
         recon_error = (outputs["reconstruction"] - next_policy_obs.detach()).pow(2)
@@ -1544,6 +1608,34 @@ def export_cenet_policy_as_onnx(
     )
 
 
+def _patch_on_policy_runner_checkpointing(on_policy_runner_module) -> None:
+    runner_cls = on_policy_runner_module.OnPolicyRunner
+    if getattr(runner_cls, "_ddt_cenet_checkpoint_patch", False):
+        return
+
+    original_save = runner_cls.save
+    original_load = runner_cls.load
+
+    def save_with_extra_state(self, path: str, infos: dict | None = None) -> None:
+        original_save(self, path, infos)
+        if not hasattr(self.alg, "get_extra_checkpoint_state"):
+            return
+        saved_dict = torch.load(path, weights_only=False, map_location="cpu")
+        saved_dict.update(self.alg.get_extra_checkpoint_state())
+        torch.save(saved_dict, path)
+
+    def load_with_extra_state(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
+        loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
+        infos = original_load(self, path, load_optimizer=load_optimizer, map_location=map_location)
+        if hasattr(self.alg, "load_extra_checkpoint_state"):
+            self.alg.load_extra_checkpoint_state(loaded_dict, load_optimizer=load_optimizer)
+        return infos
+
+    runner_cls.save = save_with_extra_state
+    runner_cls.load = load_with_extra_state
+    runner_cls._ddt_cenet_checkpoint_patch = True
+
+
 class PPOWithCENetAdaBoot(PPO):
     """PPO with DreamWaQ CENet losses and adaptive estimator bootstrapping."""
 
@@ -1554,6 +1646,10 @@ class PPOWithCENetAdaBoot(PPO):
         cenet_velocity_loss_coef: float = 1.0,
         cenet_reconstruction_loss_coef: float = 1.0,
         cenet_kl_loss_coef: float = 1.0,
+        vae_learning_rate: float | None = None,
+        num_vae_substeps: int = 1,
+        rl_grad_to_cenet: bool = True,
+        adaboot_enabled: bool = True,
         adaboot_reward_window: int = 128,
         adaboot_min_episodes: int = 32,
         adaboot_eps: float = 1.0e-6,
@@ -1564,12 +1660,20 @@ class PPOWithCENetAdaBoot(PPO):
         self.cenet_velocity_loss_coef = cenet_velocity_loss_coef
         self.cenet_reconstruction_loss_coef = cenet_reconstruction_loss_coef
         self.cenet_kl_loss_coef = cenet_kl_loss_coef
+        self.vae_learning_rate = self.learning_rate if vae_learning_rate is None else float(vae_learning_rate)
+        self.num_vae_substeps = int(num_vae_substeps)
+        if self.num_vae_substeps < 0:
+            raise ValueError("num_vae_substeps must be greater than or equal to zero.")
+        self.rl_grad_to_cenet = bool(rl_grad_to_cenet)
+        self.vae_optimizer = torch.optim.Adam(self.policy.cenet_parameters(), lr=self.vae_learning_rate)
+        self.adaboot_enabled = bool(adaboot_enabled)
         self.adaboot_reward_window = int(adaboot_reward_window)
         self.adaboot_min_episodes = int(adaboot_min_episodes)
         self.adaboot_eps = float(adaboot_eps)
         self._recent_episode_returns = deque(maxlen=self.adaboot_reward_window)
         self._episode_returns = None
         self._current_bootstrap_mask = None
+        self._current_actor_velocity_code = None
         self.adaboot_probability = 0.0
         self.adaboot_cv = 0.0
 
@@ -1590,6 +1694,50 @@ class PPOWithCENetAdaBoot(PPO):
             dtype=torch.bool,
             device=self.device,
         )
+        self._cenet_actor_velocity_codes = torch.zeros(
+            num_transitions_per_env,
+            num_envs,
+            self.policy.cenet_velocity_dim,
+            device=self.device,
+            dtype=sample_tensor.dtype,
+        )
+
+    def _compute_cenet_total_loss(self, cenet_losses: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.cenet_loss_coef * (
+            self.cenet_velocity_loss_coef * cenet_losses["velocity"]
+            + self.cenet_reconstruction_loss_coef * cenet_losses["reconstruction"]
+            + self.cenet_kl_loss_coef * cenet_losses["kl"]
+        )
+
+    def _reduce_cenet_parameters(self) -> None:
+        params = list(self.policy.cenet_parameters())
+        grads = [param.grad.view(-1) for param in params if param.grad is not None]
+        if not grads:
+            return
+
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        offset = 0
+        for param in params:
+            if param.grad is None:
+                continue
+            numel = param.numel()
+            param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+            offset += numel
+
+    def get_extra_checkpoint_state(self) -> dict[str, object]:
+        return {
+            "vae_optimizer_state_dict": self.vae_optimizer.state_dict(),
+            "vae_learning_rate": self.vae_learning_rate,
+            "rl_grad_to_cenet": self.rl_grad_to_cenet,
+            "num_vae_substeps": self.num_vae_substeps,
+        }
+
+    def load_extra_checkpoint_state(self, loaded_dict: dict[str, object], load_optimizer: bool = True) -> None:
+        if load_optimizer and "vae_optimizer_state_dict" in loaded_dict:
+            self.vae_optimizer.load_state_dict(loaded_dict["vae_optimizer_state_dict"])
 
     def _ensure_episode_return_buffer(self, num_envs: int, device: torch.device):
         if self._episode_returns is None or self._episode_returns.numel() != num_envs:
@@ -1609,7 +1757,12 @@ class PPOWithCENetAdaBoot(PPO):
         self.adaboot_probability = float(probability.item())
         return self.adaboot_probability
 
-    def _sample_bootstrap_mask(self, obs) -> torch.Tensor:
+    def _sample_bootstrap_mask(self, obs) -> torch.Tensor | None:
+        if not self.adaboot_enabled:
+            self.adaboot_cv = 0.0
+            self.adaboot_probability = 0.0
+            return None
+
         num_envs = obs.batch_size[0] if hasattr(obs, "batch_size") else obs["policy"].shape[0]
         probability = self._compute_adaboot_probability()
         if probability <= 0.0:
@@ -1631,7 +1784,14 @@ class PPOWithCENetAdaBoot(PPO):
             self.transition.hidden_states = self.policy.get_hidden_states()
 
         self._current_bootstrap_mask = self._sample_bootstrap_mask(obs)
-        self.transition.actions = self.policy.act(obs, bootstrap_mask=self._current_bootstrap_mask).detach()
+        self.transition.actions = self.policy.act(
+            obs,
+            bootstrap_mask=self._current_bootstrap_mask,
+            detach_cenet=not self.rl_grad_to_cenet,
+        ).detach()
+        self._current_actor_velocity_code = self.policy.last_actor_velocity_code
+        if self._current_actor_velocity_code is not None:
+            self._current_actor_velocity_code = self._current_actor_velocity_code.detach()
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
@@ -1648,6 +1808,8 @@ class PPOWithCENetAdaBoot(PPO):
             else:
                 bootstrap_mask = self._current_bootstrap_mask.to(device=self.device, dtype=torch.bool)
             self._cenet_bootstrap_masks[step].copy_(bootstrap_mask)
+            if self._current_actor_velocity_code is not None:
+                self._cenet_actor_velocity_codes[step].copy_(self._current_actor_velocity_code.to(self.device))
 
         self.policy.update_normalization(obs, bootstrap_mask=self._current_bootstrap_mask)
         if self.rnd:
@@ -1670,6 +1832,7 @@ class PPOWithCENetAdaBoot(PPO):
         self.transition.clear()
         self.policy.reset(dones)
         self._current_bootstrap_mask = None
+        self._current_actor_velocity_code = None
 
     def _mini_batch_generator_with_cenet(self):
         batch_size = self.storage.num_envs * self.storage.num_transitions_per_env
@@ -1686,6 +1849,7 @@ class PPOWithCENetAdaBoot(PPO):
         old_sigma = self.storage.sigma.flatten(0, 1)
         next_policy_obs = self._cenet_next_policy_obs.flatten(0, 1)
         bootstrap_masks = self._cenet_bootstrap_masks.flatten(0, 1)
+        actor_velocity_codes = self._cenet_actor_velocity_codes.flatten(0, 1)
         dones = self.storage.dones.flatten(0, 1)
 
         for _ in range(self.num_learning_epochs):
@@ -1704,6 +1868,7 @@ class PPOWithCENetAdaBoot(PPO):
                     old_sigma[batch_idx],
                     next_policy_obs[batch_idx],
                     bootstrap_masks[batch_idx],
+                    actor_velocity_codes[batch_idx],
                     dones[batch_idx],
                 )
 
@@ -1731,6 +1896,7 @@ class PPOWithCENetAdaBoot(PPO):
             old_sigma_batch,
             next_policy_obs_batch,
             bootstrap_mask_batch,
+            actor_velocity_code_batch,
             dones_batch,
         ) in self._mini_batch_generator_with_cenet():
             original_batch_size = obs_batch.batch_size[0]
@@ -1739,7 +1905,14 @@ class PPOWithCENetAdaBoot(PPO):
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
-            self.policy.act(obs_batch, bootstrap_mask=bootstrap_mask_batch)
+            bootstrap_mask_arg = bootstrap_mask_batch if self.adaboot_enabled else None
+            actor_velocity_code_arg = None if self.rl_grad_to_cenet else actor_velocity_code_batch
+            self.policy.act(
+                obs_batch,
+                bootstrap_mask=bootstrap_mask_arg,
+                detach_cenet=not self.rl_grad_to_cenet,
+                actor_velocity_code=actor_velocity_code_arg,
+            )
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(obs_batch)
             mu_batch = self.policy.action_mean[:original_batch_size]
@@ -1788,18 +1961,10 @@ class PPOWithCENetAdaBoot(PPO):
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            cenet_losses = self.policy.compute_cenet_losses(obs_batch, next_policy_obs_batch, dones_batch)
-            cenet_total_loss = (
-                self.cenet_velocity_loss_coef * cenet_losses["velocity"]
-                + self.cenet_reconstruction_loss_coef * cenet_losses["reconstruction"]
-                + self.cenet_kl_loss_coef * cenet_losses["kl"]
-            )
-
-            loss = (
+            ppo_loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy_batch.mean()
-                + self.cenet_loss_coef * cenet_total_loss
             )
 
             if self.rnd:
@@ -1811,7 +1976,7 @@ class PPOWithCENetAdaBoot(PPO):
                 rnd_loss = torch.nn.functional.mse_loss(predicted_embedding, target_embedding)
 
             self.optimizer.zero_grad()
-            loss.backward()
+            ppo_loss.backward()
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
                 rnd_loss.backward()
@@ -1823,6 +1988,37 @@ class PPOWithCENetAdaBoot(PPO):
             self.optimizer.step()
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
+
+            self.optimizer.zero_grad()
+            if self.rnd_optimizer:
+                self.rnd_optimizer.zero_grad()
+
+            cenet_losses = {
+                "velocity": torch.zeros((), device=self.device),
+                "reconstruction": torch.zeros((), device=self.device),
+                "kl": torch.zeros((), device=self.device),
+            }
+            cenet_total_loss = torch.zeros((), device=self.device)
+            if self.num_vae_substeps > 0:
+                for _ in range(self.num_vae_substeps):
+                    sub_cenet_losses = self.policy.compute_cenet_losses(obs_batch, next_policy_obs_batch, dones_batch)
+                    sub_cenet_total_loss = self._compute_cenet_total_loss(sub_cenet_losses)
+
+                    self.vae_optimizer.zero_grad()
+                    sub_cenet_total_loss.backward()
+                    if self.is_multi_gpu:
+                        self._reduce_cenet_parameters()
+                    nn.utils.clip_grad_norm_(self.policy.cenet_parameters(), self.max_grad_norm)
+                    self.vae_optimizer.step()
+
+                    for key in cenet_losses:
+                        cenet_losses[key] = cenet_losses[key] + sub_cenet_losses[key].detach()
+                    cenet_total_loss = cenet_total_loss + sub_cenet_total_loss.detach()
+
+                for key in cenet_losses:
+                    cenet_losses[key] = cenet_losses[key] / self.num_vae_substeps
+                cenet_total_loss = cenet_total_loss / self.num_vae_substeps
+                self.vae_optimizer.zero_grad()
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
@@ -2004,10 +2200,10 @@ class PPOWithEstimator(PPO):
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             estimator_loss = torch.zeros((), device=self.device)
-            if self.policy.obs_groups.get("privileged"):
-                predicted_privileged = self.policy.estimate_from_history(obs_batch)
-                target_privileged = self.policy.get_estimator_targets(obs_batch).detach()
-                estimator_loss = mse_loss(predicted_privileged, target_privileged)
+            if self.policy.velocity_target_groups:
+                predicted_velocity = self.policy.estimate_from_history(obs_batch)
+                target_velocity = self.policy.get_estimator_targets(obs_batch).detach()
+                estimator_loss = mse_loss(predicted_velocity, target_velocity)
                 loss = loss + self.estimator_loss_coef * estimator_loss
 
             if self.symmetry:
@@ -2086,7 +2282,7 @@ class PPOWithEstimator(PPO):
 
 
 class PPOWithEstimatorAdaBoot(PPOWithEstimator):
-    """PPOWithEstimator with adaptive privileged-velocity bootstrapping for the actor input."""
+    """PPOWithEstimator with adaptive velocity-target bootstrapping for the actor input."""
 
     def __init__(
         self,
@@ -2212,3 +2408,4 @@ def register_rsl_rl_estimator_extensions():
     on_policy_runner_module.PPOWithEstimator = PPOWithEstimator
     on_policy_runner_module.PPOWithEstimatorAdaBoot = PPOWithEstimatorAdaBoot
     on_policy_runner_module.PPOWithCENetAdaBoot = PPOWithCENetAdaBoot
+    _patch_on_policy_runner_checkpointing(on_policy_runner_module)

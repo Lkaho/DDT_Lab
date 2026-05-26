@@ -114,8 +114,8 @@ class ObservationsCfgWithoutBaseVel:
             self.history_length = 1
 
     @configclass
-    class PrivilegedCfg(ObsGroup):
-        """Supervision targets for the velocity estimator."""
+    class VelocityTargetCfg(ObsGroup):
+        """Velocity supervision target for the estimator."""
 
         base_lin_vel_xy = ObsTerm(func=mdp.base_lin_vel_xy, scale=1.0)
 
@@ -127,7 +127,7 @@ class ObservationsCfgWithoutBaseVel:
     policy: PolicyCfg = PolicyCfg()
     history: HistoryCfg = HistoryCfg()
     critic: CriticCfg = CriticCfg()
-    privileged: PrivilegedCfg = PrivilegedCfg()
+    velocity_target: VelocityTargetCfg = VelocityTargetCfg()
 
 
 @configclass

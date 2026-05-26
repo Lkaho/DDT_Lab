@@ -11,6 +11,8 @@ from . import agents, flat_env_cfg, no_base_vel_env_cfg, rough_env_cfg, stair_en
 # Register Gym environments.
 ##
 
+POSITIVE_REWARD_ENV_ENTRY_POINT = "ddt_lab.tasks.manager_based.locomotion.positive_reward_env:PositiveRewardManagerBasedRLEnv"
+
 gym.register(
     id="DDT-Velocity-Flat-Tita-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -18,6 +20,26 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": flat_env_cfg.TitaFlatEnvCfg,
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="DDT-Velocity-Flat-Tita-CENet-v0",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": flat_env_cfg.TitaFlatCENetEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatCENetAdaBootPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="DDT-Velocity-Flat-Tita-CENet-Play-v0",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": flat_env_cfg.TitaFlatCENetEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatCENetAdaBootPPORunnerCfg",
     },
 )
 
@@ -54,7 +76,7 @@ gym.register(
 
 gym.register(
     id="DDT-Velocity-Stair-Tita-Estimator-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": stair_env_cfg.TitaStairEnvCfg,
@@ -64,7 +86,7 @@ gym.register(
 
 gym.register(
     id="DDT-Velocity-Stair-Tita-Estimator-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": stair_env_cfg.TitaStairEnvCfg_PLAY,
@@ -94,7 +116,7 @@ gym.register(
 
 gym.register(
     id="DDT-Velocity-Stair-Tita-CENet-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": stair_env_cfg.TitaStairCENetEnvCfg,
@@ -102,15 +124,17 @@ gym.register(
     },
 )
 
+
 gym.register(
     id="DDT-Velocity-Stair-Tita-CENet-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": stair_env_cfg.TitaStairCENetEnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairCENetAdaBootPPORunnerCfg",
     },
 )
+
 
 gym.register(
     id="DDT-Velocity-Stair-Tita-NoBaseVel-v0",

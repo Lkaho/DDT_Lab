@@ -85,7 +85,7 @@ def _enable_velocity_estimator(
         "policy": ["policy"],
         "critic": ["critic"],
         "history": ["history"],
-        "privileged": ["privileged"],
+        "velocity_target": ["velocity_target"],
     }
 
 
@@ -176,11 +176,22 @@ class TitaStairCENetAdaBootPPORunnerCfg(TitaRoughPPORunnerCfg):
         self.algorithm.cenet_velocity_loss_coef = 1.0
         self.algorithm.cenet_reconstruction_loss_coef = 1.0
         self.algorithm.cenet_kl_loss_coef = 1.0
+        self.algorithm.vae_learning_rate = 1.0e-3
+        self.algorithm.num_vae_substeps = 1
+        self.algorithm.rl_grad_to_cenet = True
+        self.algorithm.adaboot_enabled = True
         self.algorithm.adaboot_reward_window = 128
         self.algorithm.adaboot_min_episodes = 32
         self.obs_groups = {
             "policy": ["policy"],
             "critic": ["critic"],
             "history": ["history"],
-            "privileged": ["privileged"],
+            "velocity_target": ["velocity_target"],
         }
+
+
+@configclass
+class TitaFlatCENetAdaBootPPORunnerCfg(TitaStairCENetAdaBootPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "tita_flat_cenet_adaboot"

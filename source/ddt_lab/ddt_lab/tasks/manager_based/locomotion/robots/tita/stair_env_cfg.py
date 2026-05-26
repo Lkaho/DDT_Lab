@@ -318,7 +318,9 @@ class StairEstimatorObservationsCfg:
             self.history_length = 1
 
     @configclass
-    class PrivilegedCfg(ObsGroup):
+    class VelocityTargetCfg(ObsGroup):
+        """Velocity supervision target for the estimator."""
+
         base_lin_vel_xy = ObsTerm(func=mdp.base_lin_vel_xy, scale=1.0)
 
         def __post_init__(self):
@@ -329,7 +331,7 @@ class StairEstimatorObservationsCfg:
     policy: PolicyCfg = PolicyCfg()
     history: HistoryCfg = HistoryCfg()
     critic: CriticCfg = CriticCfg()
-    privileged: PrivilegedCfg = PrivilegedCfg()
+    velocity_target: VelocityTargetCfg = VelocityTargetCfg()
 
 
 @configclass
@@ -353,7 +355,9 @@ class StairCENetObservationsCfg:
         pass
 
     @configclass
-    class PrivilegedCfg(ObsGroup):
+    class VelocityTargetCfg(ObsGroup):
+        """Velocity supervision target for CENet; critic privileged observations live in ``critic``."""
+
         base_lin_vel = ObsTerm(func=mdp.diag_base_lin_vel, scale=1.0)
 
         def __post_init__(self):
@@ -364,7 +368,7 @@ class StairCENetObservationsCfg:
     policy: PolicyCfg = PolicyCfg()
     history: HistoryCfg = HistoryCfg()
     critic: CriticCfg = CriticCfg()
-    privileged: PrivilegedCfg = PrivilegedCfg()
+    velocity_target: VelocityTargetCfg = VelocityTargetCfg()
 
 
 @configclass
@@ -474,13 +478,13 @@ class StairRewardsCfg(RewardsCfg):
     # ---------------------------------------------------------------------
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_exp,
-        weight=3.0,
+        weight=5.0,
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
 
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_exp,
-        weight=2.5,
+        weight=3.5,
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
 
@@ -536,7 +540,7 @@ class StairRewardsCfg(RewardsCfg):
     )
     tracking_target_pos = RewTerm(
         func=mdp.track_ff_target_pos_exp,
-        weight=1.0,
+        weight=2.0,
         params={
             "action_name": "joint_pos",
             "asset_cfg": SceneEntityCfg("robot"),
@@ -756,6 +760,10 @@ class TitaStairEnvCfg(TitaStairBaseEnvCfg):
 
     observations: StairEstimatorObservationsCfg = StairEstimatorObservationsCfg()
 
+    def __post_init__(self):
+        super().__post_init__()
+        self.only_positive_rewards = True
+
 
 @configclass
 class TitaStairNoBaseVelEnvCfg(TitaStairBaseEnvCfg):
@@ -769,6 +777,16 @@ class TitaStairCENetEnvCfg(TitaStairBaseEnvCfg):
     """Tita stair-climbing environment with CENet context estimation for AdaBoot."""
 
     observations: StairCENetObservationsCfg = StairCENetObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.only_positive_rewards = True
+        self.rewards.base_height_l2.weight = -10.0
+        self.rewards.flat_orientation_l2.weight = -2.0
+        self.rewards.opposite_base_vel.weight = -5.0
+        self.rewards.opposite_wheel_vel.weight = -0.5
+        self.rewards.feet_y_distance.weight = -0.5
 
 
 @configclass

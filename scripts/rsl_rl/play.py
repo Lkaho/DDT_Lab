@@ -813,9 +813,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print(f"    tracking_error_xy:   {tracking_error_xy.detach().cpu().numpy()}")
                     print(f"    track_lin_vel_xy_exp:{track_lin_vel_xy_exp.item():.4f}")
                     if estimated_velocity is not None:
-                        estimated_tracking_error_xy = estimated_velocity - command_xy.detach().cpu()
-                        estimator_error_xy = estimated_velocity - true_vel_xy.detach().cpu()
-                        print(f"    estimated_vel_xy:    {estimated_velocity.numpy()}")
+                        estimated_velocity_xy = estimated_velocity[: true_vel_xy.numel()]
+                        estimated_tracking_error_xy = estimated_velocity_xy - command_xy.detach().cpu()
+                        estimator_error_xy = estimated_velocity_xy - true_vel_xy.detach().cpu()
+                        print(f"    estimated_vel_xy:    {estimated_velocity_xy.numpy()}")
                         print(f"    estimated_track_err: {estimated_tracking_error_xy.numpy()}")
                         print(f"    estimator_error_xy:  {estimator_error_xy.numpy()}")
 
