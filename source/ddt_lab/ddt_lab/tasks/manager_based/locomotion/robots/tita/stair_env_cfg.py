@@ -19,11 +19,52 @@ from .rough_env_cfg import EventCfg, RewardsCfg, TitaRoughEnvCfg, configure_forw
 from .rough_env_cfg import TerminationsCfg as RoughTerminationsCfg
 
 
+# STAIR_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
+#     size=(8.0, 8.0),
+#     border_width=20.0,
+#     num_rows=10,
+#     num_cols=10,
+#     horizontal_scale=0.1,
+#     vertical_scale=0.005,
+#     slope_threshold=0.75,
+#     difficulty_range=(0.0, 1.0),
+#     use_cache=False,
+#     curriculum=True,
+#     sub_terrains={
+#         "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+#             proportion=0.10,
+#             noise_range=(0.01, 0.05),
+#             noise_step=0.02,
+#             border_width=0.25,
+#         ),
+#         "smooth_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+#             proportion=0.10,
+#             slope_range=(0.0, 0.3),
+#             platform_width=2.0,
+#             border_width=0.25,
+#         ),
+#         "discrete_obstacles": terrain_gen.MeshRandomGridTerrainCfg(
+#             proportion=0.20,
+#             grid_width=0.45,
+#             grid_height_range=(0.02, 0.10),
+#             platform_width=2.0,
+#         ),
+#         "stairs_down": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+#             proportion=0.50,
+#             step_height_range=(0.08, 0.15),
+#             step_width=0.5,
+#             platform_width=2.5,
+#             border_width=0.0,
+#             holes=False,
+#         ),
+#         "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.10),
+#     },
+# )
 STAIR_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=20.0,
     num_rows=10,
-    num_cols=20,
+    num_cols=10,
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
@@ -31,33 +72,27 @@ STAIR_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     use_cache=False,
     curriculum=True,
     sub_terrains={
-        "stairs_down": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
-            proportion=0.40,
-            step_height_range=(0.08, 0.15),
-            step_width=0.6,
-            platform_width=2.5,
-            border_width=0.0,
-            holes=False,
-        ),
         "smooth_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
-            proportion=0.15,
+            proportion=0.20,
             slope_range=(0.0, 0.3),
             platform_width=2.0,
             border_width=0.25,
         ),
         "discrete_obstacles": terrain_gen.MeshRandomGridTerrainCfg(
-            proportion=0.15,
+            proportion=0.20,
             grid_width=0.45,
             grid_height_range=(0.02, 0.10),
             platform_width=2.0,
         ),
-        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.15,
-            noise_range=(0.01, 0.05),
-            noise_step=0.02,
-            border_width=0.25,
+        "stairs_down": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+            proportion=0.50,
+            step_height_range=(0.08, 0.15),
+            step_width=0.5,
+            platform_width=2.5,
+            border_width=0.0,
+            holes=False,
         ),
-        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.15),
+        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.10),
     },
 )
 
@@ -422,10 +457,10 @@ class StairActionsCfg:
         contact_sensor_name="contact_forces",
         contact_body_pattern=".*_leg_4",
         contact_force_threshold=50.0,
-        followup_trigger_delay_factor=0.0,
+        followup_trigger_delay_factor=0.5,
         k_ff_anneal_enabled=True,
         k_ff_final=0.0,
-        k_ff_start_iteration=20000,
+        k_ff_start_iteration=10000,
         k_ff_anneal_iterations=10000,
         k_ff_steps_per_iteration=24,
     )
@@ -478,19 +513,19 @@ class StairRewardsCfg(RewardsCfg):
     # ---------------------------------------------------------------------
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_exp,
-        weight=5.0,
+        weight=3.0,
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
 
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_exp,
-        weight=3.5,
+        weight=2.0,
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
 
     track_heading_exp = RewTerm(
         func=mdp.track_heading_exp,
-        weight=0.5,
+        weight=1.0,
         params={
             "command_name": "base_velocity",
             "std": math.sqrt(0.25),
@@ -506,6 +541,7 @@ class StairRewardsCfg(RewardsCfg):
             "asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"]),
         },
     )
+
     feet_air_time = RewTerm(
         func=mdp.feet_air_time,
         weight=1.0,
@@ -513,8 +549,11 @@ class StairRewardsCfg(RewardsCfg):
             "command_name": "base_velocity",
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
             "threshold": 0.1,
+            "triggered_only": True,
+            "action_name": "joint_pos",
         },
     )
+
     feet_height = RewTerm(
         func=mdp.feet_height_band_relative,
         weight=1.0,
@@ -522,25 +561,39 @@ class StairRewardsCfg(RewardsCfg):
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_leg_4"]),
             "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "target_height": 0.12,
+            "target_height": 0.10,
             "std": 0.05,
             "tanh_mult": 2.0,
             "wheel_radius": 0.0925,
             "action_name": "joint_pos",
         },
     )
+
     feet_contact_number = RewTerm(
-        func=mdp.feet_contact_number,
+        func=mdp.feet_xy_swing_fz_stance_match,
         weight=1.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
+            "action_name": "joint_pos",
             "mismatch_penalty": 1.3,
-            "contact_threshold": 5.0,
+            "swing_xy_threshold": 50.0,
+            "stance_fz_threshold": 50.0,
         },
     )
+
+    # feet_swing_xy_impact = RewTerm(
+    #     func=mdp.feet_swing_xy_impact_penalty,
+    #     weight=-0.002,
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
+    #         "action_name": "joint_pos",
+    #         "xy_force_threshold": 50.0,
+    #     },
+    # )
+
     tracking_target_pos = RewTerm(
         func=mdp.track_ff_target_pos_exp,
-        weight=2.0,
+        weight= 0.8,
         params={
             "action_name": "joint_pos",
             "asset_cfg": SceneEntityCfg("robot"),
@@ -551,28 +604,23 @@ class StairRewardsCfg(RewardsCfg):
     # ---------------------------------------------------------------------
     # Style rewards
     # ---------------------------------------------------------------------
-    # joint_deviation_no_lift = RewTerm(
-    #     func=mdp.joint_deviation_l2_no_lift,
-    #     weight=-1.0,
-    #     params={
-    #         "command_name": "base_velocity",
-    #         "command_threshold": 0.1,
-    #         "action_name": "joint_pos",
-    #         "asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"]),
-    #     },
-    # )
-
-    # joint_deviation_legs_l1 = None
 
     joint_mirror = RewTerm(
-        func=mdp.joint_mirror,
-        weight=-0.1,
+        func=mdp.stair_joint_mirror,
+        weight=-1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "mirror_joints": [["joint_left_leg_(1|2|3)", "joint_right_leg_(1|2|3)"]],
+            "action_name": "joint_pos",
         },
     )
     # joint_mirror = None
+
+    joint_deviation_leg1_l1 = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-2.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_1"])},
+    )
 
     wheel_vel_penalty = RewTerm(
         func=mdp.wheel_vel_penalty,
@@ -612,11 +660,13 @@ class StairRewardsCfg(RewardsCfg):
 
     base_height_l2 = RewTerm(
         func=mdp.base_height_l2,
-        weight=-40.0,
+        weight=-20.0,
         params={"target_height": 0.35, "sensor_cfg": SceneEntityCfg("height_scanner")},
     )
 
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-12.0)
+
+    upward = RewTerm(func=mdp.upward, weight= 1.0)
 
     # ---------------------------------------------------------------------
     # Regularization rewards
@@ -648,6 +698,7 @@ class StairRewardsCfg(RewardsCfg):
         weight=-40.0,
         params={"command_name": "base_velocity"},
     )
+
     opposite_wheel_vel = RewTerm(
         func=mdp.opposite_wheel_vel,
         weight=-2.0,
@@ -669,6 +720,18 @@ class StairCurriculumCfg:
     """
 
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+    terrain_level = CurrTerm(
+        func=mdp.terrain_levels_by_type,
+        params={
+            "terrain_names": [
+                "random_rough",
+                "smooth_slope",
+                "discrete_obstacles",
+                "stairs_down",
+                "flat",
+            ],
+        },
+    )
 
 
 @configclass
@@ -762,7 +825,7 @@ class TitaStairEnvCfg(TitaStairBaseEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.only_positive_rewards = True
+        self.only_positive_rewards = False
 
 
 @configclass
@@ -781,11 +844,11 @@ class TitaStairCENetEnvCfg(TitaStairBaseEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.only_positive_rewards = True
+        self.only_positive_rewards = False
         self.rewards.base_height_l2.weight = -10.0
-        self.rewards.flat_orientation_l2.weight = -2.0
-        self.rewards.opposite_base_vel.weight = -5.0
-        self.rewards.opposite_wheel_vel.weight = -0.5
+        self.rewards.flat_orientation_l2.weight = -15.0
+        self.rewards.opposite_base_vel.weight = -10.0
+        self.rewards.opposite_wheel_vel.weight = -1.0
         self.rewards.feet_y_distance.weight = -0.5
 
 

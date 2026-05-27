@@ -53,3 +53,50 @@ def terrain_levels_vel(
     terrain.update_env_origins(env_ids, move_up, move_down)
     # return the mean terrain level
     return torch.mean(terrain.terrain_levels.float())
+
+
+def terrain_levels_by_type(
+    env: RLTaskEnv, env_ids: Sequence[int], terrain_names: Sequence[str]
+) -> dict[str, torch.Tensor]:
+    """Report the mean terrain level for each requested terrain type without updating curriculum state."""
+    terrain: TerrainImporter = env.scene.terrain
+    terrain_generator_cfg = terrain.cfg.terrain_generator
+    device = terrain.terrain_levels.device
+
+    sub_terrain_names = list(terrain_generator_cfg.sub_terrains.keys())
+    proportions = [terrain_generator_cfg.sub_terrains[name].proportion for name in sub_terrain_names]
+    proportion_sum = sum(proportions)
+    cumulative_proportions = []
+    running_proportion = 0.0
+    for proportion in proportions:
+        running_proportion += proportion / proportion_sum
+        cumulative_proportions.append(running_proportion)
+    cumulative_proportions[-1] = 1.0
+
+    terrain_name_by_col = []
+    for col in range(terrain_generator_cfg.num_cols):
+        col_fraction = col / terrain_generator_cfg.num_cols + 0.001
+        sub_terrain_index = next(
+            index
+            for index, cumulative_proportion in enumerate(cumulative_proportions)
+            if col_fraction < cumulative_proportion
+        )
+        terrain_name_by_col.append(sub_terrain_names[sub_terrain_index])
+
+    terrain_level_stats = {}
+    for terrain_name in terrain_names:
+        type_ids = [
+            col for col, col_terrain_name in enumerate(terrain_name_by_col) if col_terrain_name == terrain_name
+        ]
+        if len(type_ids) == 0:
+            terrain_level_stats[terrain_name] = torch.zeros((), device=device)
+            continue
+
+        type_ids_tensor = torch.tensor(type_ids, device=device, dtype=terrain.terrain_types.dtype)
+        terrain_type_mask = (terrain.terrain_types[:, None] == type_ids_tensor[None, :]).any(dim=1)
+        if terrain_type_mask.any():
+            terrain_level_stats[terrain_name] = terrain.terrain_levels[terrain_type_mask].float().mean()
+        else:
+            terrain_level_stats[terrain_name] = torch.zeros((), device=device)
+
+    return terrain_level_stats

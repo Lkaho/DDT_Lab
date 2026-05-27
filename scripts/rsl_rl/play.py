@@ -931,8 +931,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         print(
                             f"      {joint_name:<25} raw={ff_raw:>8.4f}  contribution={ff_scaled:>8.4f}"
                         )
+        timestep += 1
         if args_cli.video:
-            timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break

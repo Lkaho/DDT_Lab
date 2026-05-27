@@ -310,8 +310,8 @@ class RewardsCfg:
     )
     joint_deviation_legs_l1 = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-2.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"])},
+        weight=-1.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[23]"])},
     )
     stand_still = RewTerm(
         func=mdp.stand_still,
@@ -325,6 +325,14 @@ class RewardsCfg:
     )
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-20.0)
     base_height_l2 = RewTerm(func=mdp.base_height_l2, weight=-10.0, params={"target_height": 0.33})
+    opposite_wheel_vel = RewTerm(
+    func=mdp.opposite_wheel_vel,
+    weight=-2.0,
+    params={
+        "command_name": "base_velocity",
+        "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+    },
+    )
 
 
 @configclass

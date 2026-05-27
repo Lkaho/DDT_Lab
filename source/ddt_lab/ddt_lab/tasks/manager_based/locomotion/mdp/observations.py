@@ -35,6 +35,60 @@ def _rate_limited_env_diag(env: ManagerBasedEnv, key: str, message: str, period_
     diag_state[key] = (step, count + 1)
 
 
+def _terrain_column_names(env: ManagerBasedEnv) -> list[str] | None:
+    """Return terrain names indexed by curriculum column, matching Isaac Lab's generator logic."""
+    terrain = getattr(getattr(env, "scene", None), "terrain", None)
+    terrain_generator_cfg = getattr(getattr(terrain, "cfg", None), "terrain_generator", None)
+    if terrain_generator_cfg is None or terrain_generator_cfg.sub_terrains is None:
+        return None
+
+    sub_terrain_names = list(terrain_generator_cfg.sub_terrains.keys())
+    proportions = [terrain_generator_cfg.sub_terrains[name].proportion for name in sub_terrain_names]
+    proportion_sum = sum(proportions)
+    if len(sub_terrain_names) == 0 or proportion_sum <= 0.0:
+        return None
+
+    cumulative_proportions = []
+    running_proportion = 0.0
+    for proportion in proportions:
+        running_proportion += proportion / proportion_sum
+        cumulative_proportions.append(running_proportion)
+    cumulative_proportions[-1] = 1.0
+
+    terrain_name_by_col = []
+    for col in range(terrain_generator_cfg.num_cols):
+        col_fraction = col / terrain_generator_cfg.num_cols + 0.001
+        sub_terrain_index = next(
+            index
+            for index, cumulative_proportion in enumerate(cumulative_proportions)
+            if col_fraction < cumulative_proportion
+        )
+        terrain_name_by_col.append(sub_terrain_names[sub_terrain_index])
+    return terrain_name_by_col
+
+
+def _sample_env_terrain_context(env: ManagerBasedEnv, sample_env: int) -> str:
+    """Format terrain context for the sampled environment in diagnostic logs."""
+    if sample_env < 0:
+        return ""
+
+    terrain = getattr(getattr(env, "scene", None), "terrain", None)
+    terrain_types = getattr(terrain, "terrain_types", None)
+    terrain_levels = getattr(terrain, "terrain_levels", None)
+    if terrain_types is None or sample_env >= terrain_types.shape[0]:
+        return ""
+
+    terrain_col = int(terrain_types[sample_env].item())
+    terrain_level = int(terrain_levels[sample_env].item()) if terrain_levels is not None else -1
+    terrain_name_by_col = _terrain_column_names(env)
+    terrain_name = (
+        terrain_name_by_col[terrain_col]
+        if terrain_name_by_col is not None and 0 <= terrain_col < len(terrain_name_by_col)
+        else "unknown"
+    )
+    return f" terrain={terrain_name} terrain_col={terrain_col} terrain_level={terrain_level}"
+
+
 def _log_large_obs_term(
     env: ManagerBasedEnv,
     term_name: str,
@@ -72,6 +126,7 @@ def _log_large_obs_term(
         else:
             sample_env = int(per_env.abs().max(dim=1).values.argmax().item()) if per_env.shape[0] > 0 else -1
 
+    terrain_context = _sample_env_terrain_context(env, sample_env)
     _rate_limited_env_diag(
         env,
         f"obs_term:{term_name}",
@@ -79,7 +134,7 @@ def _log_large_obs_term(
             "[diag][obs_term] "
             f"{term_name} invalid={invalid_count} max_abs={max_abs:.3e} "
             f"min={min_value:.3e} max={max_value:.3e} sample_env={sample_env} "
-            f"shape={tuple(detached.shape)}"
+            f"shape={tuple(detached.shape)}{terrain_context}"
         ),
         period_steps=period_steps,
         max_logs=max_logs,

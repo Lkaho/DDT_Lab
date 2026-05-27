@@ -18,6 +18,17 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+_LEFT_LEG_INDEX = 0
+_RIGHT_LEG_INDEX = 1
+_FIRST_LEFT_LEG = 1
+_FIRST_RIGHT_LEG = 2
+
+
+def _leg_index_from_name(name: str) -> int:
+    """Map a left/right joint or body name to the public [left, right] leg order."""
+    return _RIGHT_LEG_INDEX if "right" in name.lower() else _LEFT_LEG_INDEX
+
+
 class JointPositionWithFeedforwardAction(JointPositionAction):
     """Joint position action with contact-triggered feedforward trajectory injection."""
 
@@ -64,13 +75,21 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
                 dtype=torch.long,
             )
             self._ff_leg_mapping = torch.tensor(
-                [0 if "right" in name.lower() else 1 for name in ff_joint_names],
+                [
+                    _leg_index_from_name(name)
+                    for joint_id, name in zip(ff_joint_ids, ff_joint_names)
+                    if joint_id in joint_ids_list
+                ],
                 device=self.device,
                 dtype=torch.long,
             )
         else:
             self._ff_local_ids = torch.arange(self._num_joints, device=self.device, dtype=torch.long)
-            self._ff_leg_mapping = torch.zeros(self._num_joints, device=self.device, dtype=torch.long)
+            self._ff_leg_mapping = torch.tensor(
+                [_leg_index_from_name(name) for name in self._joint_names],
+                device=self.device,
+                dtype=torch.long,
+            )
 
         self._time = torch.zeros(self.num_envs, 2, device=self.device)
         self._contact_sensor = None
@@ -131,6 +150,7 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
 
     @property
     def ff_target_positions(self) -> torch.Tensor:
+        # Raw FF trajectory target; final command scaling is represented separately.
         return self._last_ff_actions + self._offset
 
     def _update_k_ff_schedule(self):
@@ -148,6 +168,18 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
             current_k_ff = self._initial_k_ff + (self._k_ff_final - self._initial_k_ff) * progress
         self._k_ff = float(current_k_ff)
 
+    def _clear_feedforward_state(self):
+        self._time.zero_()
+        self._lifting_state.zero_()
+        self._first_leg.zero_()
+        self._last_lift_signal.zero_()
+        self._last_ff_signal.zero_()
+        self._last_trigger_signal.zero_()
+        self._last_ff_actions.zero_()
+        self._last_ff_contribution.zero_()
+        if hasattr(self, "_contact_force_history"):
+            self._contact_force_history.zero_()
+
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
         self._update_k_ff_schedule()
@@ -156,8 +188,10 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
         self._last_trigger_signal.zero_()
         self._last_ff_actions.zero_()
         self._last_ff_contribution.zero_()
+        ff_actions = torch.zeros_like(self._raw_actions)
 
-        if self._ff_enabled:
+        phase_enabled = self._ff_enabled and (self._contact_trigger_enabled or self._k_ff > 0.0)
+        if phase_enabled:
             if self._contact_trigger_enabled:
                 lift_signal = self._compute_lift_signal()
             else:
@@ -166,12 +200,11 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
 
             self._last_lift_signal[:] = lift_signal
             self._time += self._env.step_dt * lift_signal
-            if self._k_ff > 0.0:
-                phase = 2.0 * math.pi * self._time / self._ff_period
-                ff_signal = 0.5 * (1.0 - torch.cos(phase))
-                self._last_ff_signal[:] = ff_signal
+            phase = 2.0 * math.pi * self._time / self._ff_period
+            ff_signal = 0.5 * (1.0 - torch.cos(phase))
+            self._last_ff_signal[:] = ff_signal
 
-                ff_actions = torch.zeros_like(self._raw_actions)
+            if self._k_ff > 0.0:
                 for i, local_id in enumerate(self._ff_local_ids):
                     leg_idx = self._ff_leg_mapping[i]
                     ff_actions[:, local_id] = (
@@ -180,12 +213,11 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
                         * lift_signal[:, leg_idx]
                     )
 
-                self._last_ff_actions[:] = ff_actions
-                self._last_ff_contribution[:] = self._k_ff * ff_actions
-                blended_actions = self._k_fb * self._raw_actions + self._k_ff * ff_actions
-            else:
-                blended_actions = self._raw_actions
+            self._last_ff_actions[:] = ff_actions
+            self._last_ff_contribution[:] = self._k_ff * ff_actions
+            blended_actions = self._k_fb * self._raw_actions + self._k_ff * ff_actions
         else:
+            self._clear_feedforward_state()
             blended_actions = self._raw_actions
 
         self._last_blended_actions[:] = blended_actions
@@ -233,76 +265,98 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
             self._contact_force_history = torch.zeros(3, self.num_envs, 2, device=self.device)
 
         forces_xyz = self._contact_sensor.data.net_forces_w
-        right_xy = torch.zeros(self.num_envs, device=self.device)
         left_xy = torch.zeros(self.num_envs, device=self.device)
-        if self._right_foot_id is not None:
-            right_force = forces_xyz[:, self._right_foot_id, :]
-            right_xy = torch.sqrt(right_force[:, 0] ** 2 + right_force[:, 1] ** 2)
+        right_xy = torch.zeros(self.num_envs, device=self.device)
         if self._left_foot_id is not None:
             left_force = forces_xyz[:, self._left_foot_id, :]
             left_xy = torch.sqrt(left_force[:, 0] ** 2 + left_force[:, 1] ** 2)
+        if self._right_foot_id is not None:
+            right_force = forces_xyz[:, self._right_foot_id, :]
+            right_xy = torch.sqrt(right_force[:, 0] ** 2 + right_force[:, 1] ** 2)
 
-        feet_xy = torch.stack([right_xy, left_xy], dim=1)
+        feet_xy = torch.stack([left_xy, right_xy], dim=1)
         self._contact_force_history[:-1] = self._contact_force_history[1:].clone()
         self._contact_force_history[-1] = feet_xy
 
         avg_force = self._contact_force_history.mean(dim=0)
-        right_contact = avg_force[:, 0] > self._force_threshold
-        left_contact = avg_force[:, 1] > self._force_threshold
+        left_contact = avg_force[:, _LEFT_LEG_INDEX] > self._force_threshold
+        right_contact = avg_force[:, _RIGHT_LEG_INDEX] > self._force_threshold
 
         stable_contact = (self._contact_force_history > self._force_threshold).all(dim=0)
-        right_stable = stable_contact[:, 0]
-        left_stable = stable_contact[:, 1]
+        left_stable = stable_contact[:, _LEFT_LEG_INDEX]
+        right_stable = stable_contact[:, _RIGHT_LEG_INDEX]
 
-        trigger_right = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         trigger_left = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        trigger_right = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        no_leg_lifting = ~self._lifting_state[:, 0] & ~self._lifting_state[:, 1]
-        left_followup_ready = (self._first_leg == 1) & self._lifting_state[:, 0] & ~self._lifting_state[:, 1]
-        right_followup_ready = (self._first_leg == 2) & self._lifting_state[:, 1] & ~self._lifting_state[:, 0]
-        can_trigger_right = ~self._lifting_state[:, 0] & (no_leg_lifting | right_followup_ready)
-        can_trigger_left = ~self._lifting_state[:, 1] & (no_leg_lifting | left_followup_ready)
+        no_leg_lifting = ~self._lifting_state[:, _LEFT_LEG_INDEX] & ~self._lifting_state[:, _RIGHT_LEG_INDEX]
+        left_followup_ready = (
+            (self._first_leg == _FIRST_RIGHT_LEG)
+            & self._lifting_state[:, _RIGHT_LEG_INDEX]
+            & ~self._lifting_state[:, _LEFT_LEG_INDEX]
+            & (self._time[:, _RIGHT_LEG_INDEX] >= self._followup_trigger_delay)
+        )
+        right_followup_ready = (
+            (self._first_leg == _FIRST_LEFT_LEG)
+            & self._lifting_state[:, _LEFT_LEG_INDEX]
+            & ~self._lifting_state[:, _RIGHT_LEG_INDEX]
+            & (self._time[:, _LEFT_LEG_INDEX] >= self._followup_trigger_delay)
+        )
+        can_trigger_left = ~self._lifting_state[:, _LEFT_LEG_INDEX] & (no_leg_lifting | left_followup_ready)
+        can_trigger_right = ~self._lifting_state[:, _RIGHT_LEG_INDEX] & (no_leg_lifting | right_followup_ready)
 
-        right_only_eligible = can_trigger_right & ~can_trigger_left
         left_only_eligible = can_trigger_left & ~can_trigger_right
-        trigger_right = trigger_right | (right_only_eligible & right_contact)
+        right_only_eligible = can_trigger_right & ~can_trigger_left
         trigger_left = trigger_left | (left_only_eligible & left_contact)
+        trigger_right = trigger_right | (right_only_eligible & right_contact)
 
         both_eligible = can_trigger_right & can_trigger_left
-        only_right = right_contact & ~left_contact & both_eligible
         only_left = left_contact & ~right_contact & both_eligible
-        trigger_right = trigger_right | only_right
+        only_right = right_contact & ~left_contact & both_eligible
         trigger_left = trigger_left | only_left
+        trigger_right = trigger_right | only_right
 
         both_contact = right_contact & left_contact & both_eligible
-        trigger_right = trigger_right | (both_contact & right_stable & ~left_stable)
         trigger_left = trigger_left | (both_contact & ~right_stable & left_stable)
+        trigger_right = trigger_right | (both_contact & right_stable & ~left_stable)
 
         both_stable = both_contact & right_stable & left_stable
-        trigger_right = trigger_right | (both_stable & (avg_force[:, 0] >= avg_force[:, 1]))
-        trigger_left = trigger_left | (both_stable & (avg_force[:, 0] < avg_force[:, 1]))
-        self._last_trigger_signal[:, 0] = trigger_right
-        self._last_trigger_signal[:, 1] = trigger_left
+        trigger_left = trigger_left | (
+            both_stable & (avg_force[:, _LEFT_LEG_INDEX] > avg_force[:, _RIGHT_LEG_INDEX])
+        )
+        trigger_right = trigger_right | (
+            both_stable & (avg_force[:, _RIGHT_LEG_INDEX] >= avg_force[:, _LEFT_LEG_INDEX])
+        )
+        self._last_trigger_signal[:, _LEFT_LEG_INDEX] = trigger_left
+        self._last_trigger_signal[:, _RIGHT_LEG_INDEX] = trigger_right
 
-        self._lifting_state[:, 0] = self._lifting_state[:, 0] | trigger_right
-        self._lifting_state[:, 1] = self._lifting_state[:, 1] | trigger_left
+        self._lifting_state[:, _LEFT_LEG_INDEX] = self._lifting_state[:, _LEFT_LEG_INDEX] | trigger_left
+        self._lifting_state[:, _RIGHT_LEG_INDEX] = self._lifting_state[:, _RIGHT_LEG_INDEX] | trigger_right
 
         self._first_leg = torch.where(
-            trigger_right & (self._first_leg == 0), torch.ones_like(self._first_leg), self._first_leg
+            trigger_left & (self._first_leg == 0), torch.full_like(self._first_leg, _FIRST_LEFT_LEG), self._first_leg
         )
         self._first_leg = torch.where(
-            trigger_left & (self._first_leg == 0), torch.full_like(self._first_leg, 2), self._first_leg
+            trigger_right & (self._first_leg == 0), torch.full_like(self._first_leg, _FIRST_RIGHT_LEG), self._first_leg
         )
 
-        right_done = self._time[:, 0] >= self._ff_period
-        left_done = self._time[:, 1] >= self._ff_period
-        self._time[:, 0] = torch.where(right_done, torch.zeros_like(self._time[:, 0]), self._time[:, 0])
-        self._time[:, 1] = torch.where(left_done, torch.zeros_like(self._time[:, 1]), self._time[:, 1])
-        self._lifting_state[:, 0] = torch.where(
-            right_done, torch.zeros_like(self._lifting_state[:, 0]), self._lifting_state[:, 0]
+        left_done = self._time[:, _LEFT_LEG_INDEX] >= self._ff_period
+        right_done = self._time[:, _RIGHT_LEG_INDEX] >= self._ff_period
+        self._time[:, _LEFT_LEG_INDEX] = torch.where(
+            left_done, torch.zeros_like(self._time[:, _LEFT_LEG_INDEX]), self._time[:, _LEFT_LEG_INDEX]
         )
-        self._lifting_state[:, 1] = torch.where(
-            left_done, torch.zeros_like(self._lifting_state[:, 1]), self._lifting_state[:, 1]
+        self._time[:, _RIGHT_LEG_INDEX] = torch.where(
+            right_done, torch.zeros_like(self._time[:, _RIGHT_LEG_INDEX]), self._time[:, _RIGHT_LEG_INDEX]
+        )
+        self._lifting_state[:, _LEFT_LEG_INDEX] = torch.where(
+            left_done,
+            torch.zeros_like(self._lifting_state[:, _LEFT_LEG_INDEX]),
+            self._lifting_state[:, _LEFT_LEG_INDEX],
+        )
+        self._lifting_state[:, _RIGHT_LEG_INDEX] = torch.where(
+            right_done,
+            torch.zeros_like(self._lifting_state[:, _RIGHT_LEG_INDEX]),
+            self._lifting_state[:, _RIGHT_LEG_INDEX],
         )
 
         no_active_lifts = ~self._lifting_state.any(dim=1)
@@ -467,13 +521,21 @@ class TitaJointPositionEffortAction(ActionTerm):
                 dtype=torch.long,
             )
             self._ff_leg_mapping = torch.tensor(
-                [0 if "right" in name.lower() else 1 for name in ff_joint_names],
+                [
+                    _leg_index_from_name(name)
+                    for joint_id, name in zip(ff_joint_ids, ff_joint_names)
+                    if joint_id in leg_joint_ids_list
+                ],
                 device=self.device,
                 dtype=torch.long,
             )
         else:
             self._ff_local_ids = torch.arange(self._num_leg_joints, device=self.device, dtype=torch.long)
-            self._ff_leg_mapping = torch.zeros(self._num_leg_joints, device=self.device, dtype=torch.long)
+            self._ff_leg_mapping = torch.tensor(
+                [_leg_index_from_name(name) for name in self._leg_joint_names],
+                device=self.device,
+                dtype=torch.long,
+            )
 
         self._time = torch.zeros(self.num_envs, 2, device=self.device)
         self._contact_sensor = None
@@ -567,6 +629,7 @@ class TitaJointPositionEffortAction(ActionTerm):
 
     @property
     def ff_target_positions(self) -> torch.Tensor:
+        # Raw FF trajectory target; final command scaling is represented separately.
         return self._last_ff_actions + self._leg_offset
 
     def _update_k_ff_schedule(self):
@@ -582,6 +645,18 @@ class TitaJointPositionEffortAction(ActionTerm):
         )
         current_k_ff = self._initial_k_ff + (self._k_ff_final - self._initial_k_ff) * progress
         self._k_ff = float(current_k_ff)
+
+    def _clear_feedforward_state(self):
+        self._time.zero_()
+        self._lifting_state.zero_()
+        self._first_leg.zero_()
+        self._last_lift_signal.zero_()
+        self._last_ff_signal.zero_()
+        self._last_trigger_signal.zero_()
+        self._last_ff_actions.zero_()
+        self._last_ff_contribution.zero_()
+        if hasattr(self, "_contact_force_history"):
+            self._contact_force_history.zero_()
 
     def _log_action_diagnostics(
         self,
@@ -634,7 +709,8 @@ class TitaJointPositionEffortAction(ActionTerm):
         self._last_ff_contribution.zero_()
         ff_actions = torch.zeros_like(self._leg_raw_actions)
 
-        if self._ff_enabled:
+        phase_enabled = self._ff_enabled and (self._contact_trigger_enabled or self._k_ff > 0.0)
+        if phase_enabled:
             if self._contact_trigger_enabled:
                 lift_signal = self._compute_lift_signal()
             else:
@@ -648,13 +724,16 @@ class TitaJointPositionEffortAction(ActionTerm):
             ff_signal = 0.5 * (1.0 - torch.cos(phase))
             self._last_ff_signal[:] = ff_signal
 
-            for i, local_id in enumerate(self._ff_local_ids):
-                leg_idx = self._ff_leg_mapping[i]
-                ff_actions[:, local_id] = (
-                    ff_signal[:, leg_idx] * self._ff_amplitude[local_id] * lift_signal[:, leg_idx]
-                )
+            if self._k_ff > 0.0:
+                for i, local_id in enumerate(self._ff_local_ids):
+                    leg_idx = self._ff_leg_mapping[i]
+                    ff_actions[:, local_id] = (
+                        ff_signal[:, leg_idx] * self._ff_amplitude[local_id] * lift_signal[:, leg_idx]
+                    )
 
             self._last_ff_actions[:] = ff_actions
+        else:
+            self._clear_feedforward_state()
 
         leg_scale = self._leg_scale.to(self.device)
         policy_offset = self._k_fb * self._leg_raw_actions * leg_scale
@@ -733,76 +812,98 @@ class TitaJointPositionEffortAction(ActionTerm):
             self._contact_force_history = torch.zeros(3, self.num_envs, 2, device=self.device)
 
         forces_xyz = self._contact_sensor.data.net_forces_w
-        right_xy = torch.zeros(self.num_envs, device=self.device)
         left_xy = torch.zeros(self.num_envs, device=self.device)
-        if self._right_foot_id is not None:
-            right_force = forces_xyz[:, self._right_foot_id, :]
-            right_xy = torch.sqrt(right_force[:, 0] ** 2 + right_force[:, 1] ** 2)
+        right_xy = torch.zeros(self.num_envs, device=self.device)
         if self._left_foot_id is not None:
             left_force = forces_xyz[:, self._left_foot_id, :]
             left_xy = torch.sqrt(left_force[:, 0] ** 2 + left_force[:, 1] ** 2)
+        if self._right_foot_id is not None:
+            right_force = forces_xyz[:, self._right_foot_id, :]
+            right_xy = torch.sqrt(right_force[:, 0] ** 2 + right_force[:, 1] ** 2)
 
-        feet_xy = torch.stack([right_xy, left_xy], dim=1)
+        feet_xy = torch.stack([left_xy, right_xy], dim=1)
         self._contact_force_history[:-1] = self._contact_force_history[1:].clone()
         self._contact_force_history[-1] = feet_xy
 
         avg_force = self._contact_force_history.mean(dim=0)
-        right_contact = avg_force[:, 0] > self._force_threshold
-        left_contact = avg_force[:, 1] > self._force_threshold
+        left_contact = avg_force[:, _LEFT_LEG_INDEX] > self._force_threshold
+        right_contact = avg_force[:, _RIGHT_LEG_INDEX] > self._force_threshold
 
         stable_contact = (self._contact_force_history > self._force_threshold).all(dim=0)
-        right_stable = stable_contact[:, 0]
-        left_stable = stable_contact[:, 1]
+        left_stable = stable_contact[:, _LEFT_LEG_INDEX]
+        right_stable = stable_contact[:, _RIGHT_LEG_INDEX]
 
-        trigger_right = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         trigger_left = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        trigger_right = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        no_leg_lifting = ~self._lifting_state[:, 0] & ~self._lifting_state[:, 1]
-        left_followup_ready = (self._first_leg == 1) & self._lifting_state[:, 0] & ~self._lifting_state[:, 1]
-        right_followup_ready = (self._first_leg == 2) & self._lifting_state[:, 1] & ~self._lifting_state[:, 0]
-        can_trigger_right = ~self._lifting_state[:, 0] & (no_leg_lifting | right_followup_ready)
-        can_trigger_left = ~self._lifting_state[:, 1] & (no_leg_lifting | left_followup_ready)
+        no_leg_lifting = ~self._lifting_state[:, _LEFT_LEG_INDEX] & ~self._lifting_state[:, _RIGHT_LEG_INDEX]
+        left_followup_ready = (
+            (self._first_leg == _FIRST_RIGHT_LEG)
+            & self._lifting_state[:, _RIGHT_LEG_INDEX]
+            & ~self._lifting_state[:, _LEFT_LEG_INDEX]
+            & (self._time[:, _RIGHT_LEG_INDEX] >= self._followup_trigger_delay)
+        )
+        right_followup_ready = (
+            (self._first_leg == _FIRST_LEFT_LEG)
+            & self._lifting_state[:, _LEFT_LEG_INDEX]
+            & ~self._lifting_state[:, _RIGHT_LEG_INDEX]
+            & (self._time[:, _LEFT_LEG_INDEX] >= self._followup_trigger_delay)
+        )
+        can_trigger_left = ~self._lifting_state[:, _LEFT_LEG_INDEX] & (no_leg_lifting | left_followup_ready)
+        can_trigger_right = ~self._lifting_state[:, _RIGHT_LEG_INDEX] & (no_leg_lifting | right_followup_ready)
 
-        right_only_eligible = can_trigger_right & ~can_trigger_left
         left_only_eligible = can_trigger_left & ~can_trigger_right
-        trigger_right = trigger_right | (right_only_eligible & right_contact)
+        right_only_eligible = can_trigger_right & ~can_trigger_left
         trigger_left = trigger_left | (left_only_eligible & left_contact)
+        trigger_right = trigger_right | (right_only_eligible & right_contact)
 
         both_eligible = can_trigger_right & can_trigger_left
-        only_right = right_contact & ~left_contact & both_eligible
         only_left = left_contact & ~right_contact & both_eligible
-        trigger_right = trigger_right | only_right
+        only_right = right_contact & ~left_contact & both_eligible
         trigger_left = trigger_left | only_left
+        trigger_right = trigger_right | only_right
 
         both_contact = right_contact & left_contact & both_eligible
-        trigger_right = trigger_right | (both_contact & right_stable & ~left_stable)
         trigger_left = trigger_left | (both_contact & ~right_stable & left_stable)
+        trigger_right = trigger_right | (both_contact & right_stable & ~left_stable)
 
         both_stable = both_contact & right_stable & left_stable
-        trigger_right = trigger_right | (both_stable & (avg_force[:, 0] >= avg_force[:, 1]))
-        trigger_left = trigger_left | (both_stable & (avg_force[:, 0] < avg_force[:, 1]))
-        self._last_trigger_signal[:, 0] = trigger_right
-        self._last_trigger_signal[:, 1] = trigger_left
+        trigger_left = trigger_left | (
+            both_stable & (avg_force[:, _LEFT_LEG_INDEX] > avg_force[:, _RIGHT_LEG_INDEX])
+        )
+        trigger_right = trigger_right | (
+            both_stable & (avg_force[:, _RIGHT_LEG_INDEX] >= avg_force[:, _LEFT_LEG_INDEX])
+        )
+        self._last_trigger_signal[:, _LEFT_LEG_INDEX] = trigger_left
+        self._last_trigger_signal[:, _RIGHT_LEG_INDEX] = trigger_right
 
-        self._lifting_state[:, 0] = self._lifting_state[:, 0] | trigger_right
-        self._lifting_state[:, 1] = self._lifting_state[:, 1] | trigger_left
+        self._lifting_state[:, _LEFT_LEG_INDEX] = self._lifting_state[:, _LEFT_LEG_INDEX] | trigger_left
+        self._lifting_state[:, _RIGHT_LEG_INDEX] = self._lifting_state[:, _RIGHT_LEG_INDEX] | trigger_right
 
         self._first_leg = torch.where(
-            trigger_right & (self._first_leg == 0), torch.ones_like(self._first_leg), self._first_leg
+            trigger_left & (self._first_leg == 0), torch.full_like(self._first_leg, _FIRST_LEFT_LEG), self._first_leg
         )
         self._first_leg = torch.where(
-            trigger_left & (self._first_leg == 0), torch.full_like(self._first_leg, 2), self._first_leg
+            trigger_right & (self._first_leg == 0), torch.full_like(self._first_leg, _FIRST_RIGHT_LEG), self._first_leg
         )
 
-        right_done = self._time[:, 0] >= self._ff_period
-        left_done = self._time[:, 1] >= self._ff_period
-        self._time[:, 0] = torch.where(right_done, torch.zeros_like(self._time[:, 0]), self._time[:, 0])
-        self._time[:, 1] = torch.where(left_done, torch.zeros_like(self._time[:, 1]), self._time[:, 1])
-        self._lifting_state[:, 0] = torch.where(
-            right_done, torch.zeros_like(self._lifting_state[:, 0]), self._lifting_state[:, 0]
+        left_done = self._time[:, _LEFT_LEG_INDEX] >= self._ff_period
+        right_done = self._time[:, _RIGHT_LEG_INDEX] >= self._ff_period
+        self._time[:, _LEFT_LEG_INDEX] = torch.where(
+            left_done, torch.zeros_like(self._time[:, _LEFT_LEG_INDEX]), self._time[:, _LEFT_LEG_INDEX]
         )
-        self._lifting_state[:, 1] = torch.where(
-            left_done, torch.zeros_like(self._lifting_state[:, 1]), self._lifting_state[:, 1]
+        self._time[:, _RIGHT_LEG_INDEX] = torch.where(
+            right_done, torch.zeros_like(self._time[:, _RIGHT_LEG_INDEX]), self._time[:, _RIGHT_LEG_INDEX]
+        )
+        self._lifting_state[:, _LEFT_LEG_INDEX] = torch.where(
+            left_done,
+            torch.zeros_like(self._lifting_state[:, _LEFT_LEG_INDEX]),
+            self._lifting_state[:, _LEFT_LEG_INDEX],
+        )
+        self._lifting_state[:, _RIGHT_LEG_INDEX] = torch.where(
+            right_done,
+            torch.zeros_like(self._lifting_state[:, _RIGHT_LEG_INDEX]),
+            self._lifting_state[:, _RIGHT_LEG_INDEX],
         )
 
         no_active_lifts = ~self._lifting_state.any(dim=1)
@@ -839,7 +940,8 @@ class TitaJointPositionVelocityWithFeedforwardAction(TitaJointPositionEffortActi
         self._last_ff_contribution.zero_()
         ff_actions = torch.zeros_like(self._leg_raw_actions)
 
-        if self._ff_enabled:
+        phase_enabled = self._ff_enabled and (self._contact_trigger_enabled or self._k_ff > 0.0)
+        if phase_enabled:
             if self._contact_trigger_enabled:
                 lift_signal = self._compute_lift_signal()
             else:
@@ -853,13 +955,16 @@ class TitaJointPositionVelocityWithFeedforwardAction(TitaJointPositionEffortActi
             ff_signal = 0.5 * (1.0 - torch.cos(phase))
             self._last_ff_signal[:] = ff_signal
 
-            for i, local_id in enumerate(self._ff_local_ids):
-                leg_idx = self._ff_leg_mapping[i]
-                ff_actions[:, local_id] = (
-                    ff_signal[:, leg_idx] * self._ff_amplitude[local_id] * lift_signal[:, leg_idx]
-                )
+            if self._k_ff > 0.0:
+                for i, local_id in enumerate(self._ff_local_ids):
+                    leg_idx = self._ff_leg_mapping[i]
+                    ff_actions[:, local_id] = (
+                        ff_signal[:, leg_idx] * self._ff_amplitude[local_id] * lift_signal[:, leg_idx]
+                    )
 
             self._last_ff_actions[:] = ff_actions
+        else:
+            self._clear_feedforward_state()
 
         leg_scale = self._leg_scale.to(self.device)
         policy_offset = self._k_fb * self._leg_raw_actions * leg_scale

@@ -247,26 +247,33 @@ def track_ff_target_pos_exp(
     std: float,
     action_name: str = "joint_pos",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    min_ff_abs: float = 1.0e-6,
+    min_ff_abs: float = 2.0e-2,
 ) -> torch.Tensor:
-    """Reward tracking the FF-issued joint-position targets on the FF-controlled joints only.
+    """Early shaping reward for CTBC-style FF lifting.
 
-    The reward is active only on joints where the current FF contribution is non-zero. Its effective
-    magnitude is synchronized with the action term's internal ``k_ff`` schedule by multiplying the
-    base reward with ``current_k_ff / initial_k_ff``.
+    This reward only tells the policy that the FF-induced early lifting posture is useful.
+    It is not intended as a long-term imitation objective.
+
+    Key design:
+    - target: full FF teacher target, q0 + a_ff
+    - active mask: based on raw ff_actions, not k_ff-scaled ff_contribution
+    - weight: decays with k_ff / initial_k_ff
     """
 
     asset: Articulation = env.scene[asset_cfg.name]
     device = asset.data.joint_pos.device
     zeros = torch.zeros(env.num_envs, device=device)
+
     if action_name not in env.action_manager.active_terms:
         return zeros
 
     action_term = env.action_manager.get_term(action_name)
+
     ff_target_positions = getattr(action_term, "ff_target_positions", None)
     ff_joint_local_ids = getattr(action_term, "ff_joint_local_ids", None)
     controlled_joint_ids = getattr(action_term, "controlled_joint_ids", None)
-    ff_contribution = getattr(action_term, "ff_contribution", None)
+    ff_actions = getattr(action_term, "ff_actions", None)
+
     current_k_ff = float(getattr(action_term, "k_ff", 0.0))
     initial_k_ff = float(getattr(action_term, "initial_k_ff", 0.0))
 
@@ -274,33 +281,46 @@ def track_ff_target_pos_exp(
         ff_target_positions is None
         or ff_joint_local_ids is None
         or controlled_joint_ids is None
-        or ff_contribution is None
+        or ff_actions is None
         or current_k_ff <= 0.0
         or initial_k_ff <= 0.0
     ):
         return zeros
 
     ff_joint_local_ids = ff_joint_local_ids.to(device=device, dtype=torch.long)
+    controlled_joint_ids = controlled_joint_ids.to(device=device, dtype=torch.long)
+
     if ff_joint_local_ids.numel() == 0:
         return zeros
 
-    controlled_joint_ids = controlled_joint_ids.to(device=device, dtype=torch.long)
     ff_joint_global_ids = controlled_joint_ids[ff_joint_local_ids]
+
     current_pos = asset.data.joint_pos[:, ff_joint_global_ids]
     target_pos = ff_target_positions[:, ff_joint_local_ids]
 
-    ff_active_mask = torch.abs(ff_contribution[:, ff_joint_local_ids]) > min_ff_abs
+    # Use unscaled FF action as the active mask.
+    # Do not use ff_contribution here, otherwise k_ff affects both mask and reward weight.
+    ff_active_mask = torch.abs(ff_actions[:, ff_joint_local_ids]) > min_ff_abs
+
     active_joint_count = ff_active_mask.sum(dim=1)
     active_env_mask = active_joint_count > 0
+
     if not torch.any(active_env_mask):
         return zeros
 
     sq_err = torch.square(current_pos - target_pos) * ff_active_mask.float()
     mean_sq_err = sq_err.sum(dim=1) / active_joint_count.clamp(min=1).float()
 
-    reward = torch.exp(-mean_sq_err / std**2) * active_env_mask.float()
-    reward *= current_k_ff / max(initial_k_ff, 1.0e-6)
-    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    reward = torch.exp(-mean_sq_err / (std * std)) * active_env_mask.float()
+
+    # Since FF is only an early lifting hint, this decay should stay.
+    ff_weight = current_k_ff / max(initial_k_ff, 1.0e-6)
+    reward *= ff_weight
+
+    # Keep upright gate: avoid rewarding fallen states.
+    upright = torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
+    reward *= upright
+
     return reward
 
 
@@ -1030,6 +1050,85 @@ def feet_contact_number(
         zero_reward_mask,
         torch.zeros(env.num_envs, device=net_forces.device),
         score,
+    )
+
+
+def _left_right_contact_force_local_ids(contact_sensor: ContactSensor, sensor_cfg: SceneEntityCfg) -> list[int]:
+    """Return local force indices ordered as [left, right] for the selected bodies."""
+    body_ids = sensor_cfg.body_ids
+    if isinstance(body_ids, slice):
+        selected_body_ids = list(range(len(contact_sensor.body_names)))[body_ids]
+    else:
+        selected_body_ids = [int(body_id) for body_id in body_ids]
+
+    selected_names = [contact_sensor.body_names[body_id] for body_id in selected_body_ids]
+    left_ids = [i for i, name in enumerate(selected_names) if "left" in name.lower()]
+    right_ids = [i for i, name in enumerate(selected_names) if "right" in name.lower()]
+    if len(left_ids) != 1 or len(right_ids) != 1:
+        raise ValueError(
+            "Expected exactly one left and one right contact body for phase matching, "
+            f"got {selected_names}."
+        )
+    return [left_ids[0], right_ids[0]]
+
+
+def feet_xy_swing_fz_stance_match(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    action_name: str = "joint_pos",
+    mismatch_penalty: float = 1.3,
+    swing_xy_threshold: float = 50.0,
+    stance_fz_threshold: float = 50.0,
+) -> torch.Tensor:
+    """Reward expected swing legs by low XY force and expected stance legs by high Z force."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    left_right_ids = _left_right_contact_force_local_ids(contact_sensor, sensor_cfg)
+    net_forces = net_forces[:, left_right_ids, :]
+
+    xy_force = torch.linalg.norm(net_forces[..., :2], dim=-1)
+    actual_swing = xy_force < swing_xy_threshold
+    actual_stance = net_forces[..., 2] > stance_fz_threshold
+
+    lifting_state = _get_lifting_state(env, action_name=action_name)[:, : net_forces.shape[1]]
+    expected_swing = lifting_state.bool()
+
+    match = torch.where(expected_swing, actual_swing, actual_stance)
+    mismatch = ~match
+    score = match.float().sum(dim=1) - mismatch_penalty * mismatch.float().sum(dim=1)
+
+    active_lift = expected_swing.any(dim=1)
+    return torch.where(
+        active_lift,
+        score,
+        torch.zeros(env.num_envs, device=net_forces.device),
+    )
+
+
+def feet_swing_xy_impact_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    action_name: str = "joint_pos",
+    xy_force_threshold: float = 50.0,
+) -> torch.Tensor:
+    """Penalize triggered swing feet that keep pushing into obstacles with high XY force."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    left_right_ids = _left_right_contact_force_local_ids(contact_sensor, sensor_cfg)
+    net_forces = net_forces[:, left_right_ids, :]
+
+    lifting_state = _get_lifting_state(env, action_name=action_name)[:, : net_forces.shape[1]]
+    swing_mask = lifting_state.float()
+
+    xy_force = torch.linalg.norm(net_forces[..., :2], dim=-1)
+    impact = torch.clamp(xy_force - xy_force_threshold, min=0.0)
+    penalty = torch.sum(torch.square(impact) * swing_mask, dim=1)
+
+    active_lift = lifting_state.bool().any(dim=1)
+    return torch.where(
+        active_lift,
+        penalty,
+        torch.zeros(env.num_envs, device=net_forces.device),
     )
 
 
