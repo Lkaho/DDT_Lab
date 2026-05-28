@@ -460,7 +460,7 @@ class StairActionsCfg:
         followup_trigger_delay_factor=0.5,
         k_ff_anneal_enabled=True,
         k_ff_final=0.0,
-        k_ff_start_iteration=10000,
+        k_ff_start_iteration=20000,
         k_ff_anneal_iterations=10000,
         k_ff_steps_per_iteration=24,
     )

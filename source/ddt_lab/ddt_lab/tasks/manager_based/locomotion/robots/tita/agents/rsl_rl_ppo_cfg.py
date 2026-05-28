@@ -175,7 +175,7 @@ class TitaStairCENetAdaBootPPORunnerCfg(TitaRoughPPORunnerCfg):
         self.algorithm.cenet_loss_coef = 1.0
         self.algorithm.cenet_velocity_loss_coef = 1.0
         self.algorithm.cenet_reconstruction_loss_coef = 1.0
-        self.algorithm.cenet_kl_loss_coef = 1.0
+        self.algorithm.cenet_kl_loss_coef = 0.01
         self.algorithm.vae_learning_rate = 1.0e-3
         self.algorithm.num_vae_substeps = 1
         self.algorithm.rl_grad_to_cenet = True
