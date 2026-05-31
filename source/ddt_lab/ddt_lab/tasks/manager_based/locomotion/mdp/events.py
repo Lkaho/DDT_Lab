@@ -434,7 +434,7 @@ def apply_feedforward_trajectory(
     feedforward_period: float = 0.6,
     k_ff: float = 0.3,
     contact_force_threshold: float = 50.0,
-    followup_trigger_delay_factor: float = 0.0,
+    inter_leg_phase_lag: float = 0.0,
 ):
     """Apply a contact-triggered feedforward trajectory modifier on every step."""
     from .feedforward_modifier import FeedforwardModifier
@@ -451,7 +451,7 @@ def apply_feedforward_trajectory(
             feedforward_period=feedforward_period,
             k_ff=k_ff,
             contact_force_threshold=contact_force_threshold,
-            followup_trigger_delay_factor=followup_trigger_delay_factor,
+            inter_leg_phase_lag=inter_leg_phase_lag,
         )
     _feedforward_modifiers[env_key].update()
 

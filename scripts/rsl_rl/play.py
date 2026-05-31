@@ -86,6 +86,7 @@ import math
 import ddt_lab.tasks  # noqa: F401
 import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
+import numpy as np
 import torch
 import isaaclab.utils.math as math_utils
 from isaaclab.devices import Se2Keyboard, Se2KeyboardCfg
@@ -100,6 +101,9 @@ from ddt_lab.tasks.manager_based.locomotion.agents.rsl_rl_estimator import (
     export_estimator_policy_as_jit,
     export_estimator_policy_as_onnx,
     export_estimator_policy_metadata,
+    export_split_cenet_policy_as_jit,
+    export_split_cenet_policy_as_onnx,
+    export_split_cenet_policy_metadata,
     export_split_estimator_policy_metadata,
     is_cenet_policy,
     is_estimator_policy,
@@ -127,6 +131,13 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 register_rsl_rl_estimator_extensions()
+
+
+KEYBOARD_CAMERA_DISTANCE = 4.0
+KEYBOARD_CAMERA_TARGET_HEIGHT = 0.45
+KEYBOARD_CAMERA_HEIGHT = 1.6
+KEYBOARD_CAMERA_SMOOTHING = 0.15
+KEYBOARD_CAMERA_PRIM_PATH = "/OmniverseKit_Persp"
 
 
 def _resolve_checkpoint_iteration(runner: OnPolicyRunner | DistillationRunner, resume_path: str) -> int | None:
@@ -164,6 +175,70 @@ def _get_base_height_debug(env) -> tuple[float, float | None, float | None]:
     nearest_id = torch.argmin(distances)
     ground_height = float(valid_ray_hits[nearest_id, 2].item())
     return base_height_world, ground_height, base_height_world - ground_height
+
+
+def _compute_keyboard_follow_camera(robot) -> tuple[np.ndarray, np.ndarray]:
+    """Compute a right-rear 45 degree follow camera pose for env 0."""
+    root_pos = robot.data.root_pos_w[0].detach().cpu().numpy()
+    heading = float(robot.data.heading_w[0].detach().cpu().item())
+
+    forward = np.array([math.cos(heading), math.sin(heading)], dtype=np.float64)
+    right = np.array([math.sin(heading), -math.cos(heading)], dtype=np.float64)
+    offset_dir = -forward + right
+    offset_norm = np.linalg.norm(offset_dir)
+    if offset_norm > 1.0e-8:
+        offset_dir = offset_dir / offset_norm
+
+    target = np.array(
+        [
+            root_pos[0],
+            root_pos[1],
+            root_pos[2] + KEYBOARD_CAMERA_TARGET_HEIGHT,
+        ],
+        dtype=np.float64,
+    )
+    eye = np.array(
+        [
+            target[0] + KEYBOARD_CAMERA_DISTANCE * offset_dir[0],
+            target[1] + KEYBOARD_CAMERA_DISTANCE * offset_dir[1],
+            target[2] + KEYBOARD_CAMERA_HEIGHT,
+        ],
+        dtype=np.float64,
+    )
+    return eye, target
+
+
+class _KeyboardFollowCamera:
+    """Smoothly follow env 0 from the robot's right-rear side in keyboard play mode."""
+
+    def __init__(self):
+        self._eye: np.ndarray | None = None
+        self._target: np.ndarray | None = None
+        self._warned = False
+
+    def update(self, env) -> None:
+        try:
+            from isaacsim.core.utils.viewports import set_camera_view
+
+            robot = env.unwrapped.scene["robot"]
+            eye, target = _compute_keyboard_follow_camera(robot)
+            if self._eye is None or self._target is None:
+                self._eye = eye
+                self._target = target
+            else:
+                alpha = KEYBOARD_CAMERA_SMOOTHING
+                self._eye = (1.0 - alpha) * self._eye + alpha * eye
+                self._target = (1.0 - alpha) * self._target + alpha * target
+
+            set_camera_view(
+                eye=self._eye,
+                target=self._target,
+                camera_prim_path=KEYBOARD_CAMERA_PRIM_PATH,
+            )
+        except Exception as exc:
+            if not self._warned:
+                print(f"[WARN] Keyboard follow camera update failed: {type(exc).__name__}: {exc}")
+                self._warned = True
 
 
 def _override_joint_pos_k_ff(joint_pos_term, k_ff_override: float) -> None:
@@ -690,8 +765,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             path=export_model_dir,
             filename="policy_metadata.json",
         )
+        _attempt_export(
+            "split CENet TorchScript policies",
+            export_split_cenet_policy_as_jit,
+            policy_nn,
+            path=export_model_dir,
+        )
+        _attempt_export(
+            "split CENet ONNX policies",
+            export_split_cenet_policy_as_onnx,
+            policy_nn,
+            path=export_model_dir,
+            opset_version=args_cli.onnx_opset,
+        )
+        _attempt_export(
+            "split CENet policy metadata",
+            export_split_cenet_policy_metadata,
+            policy_nn,
+            path=export_model_dir,
+            filename="policy_split_metadata.json",
+        )
         if exported_artifacts:
-            print(f"[INFO] Exported CENet deploy artifacts to: {export_model_dir}")
+            print(f"[INFO] Exported CENet deploy artifacts (split + single-engine) to: {export_model_dir}")
         else:
             print("[WARN] CENet policy export failed; continuing play without exported artifacts.")
     else:
@@ -718,9 +813,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dt = env.unwrapped.step_dt
     print_interval = int(0.5 / dt)  # print every 0.5 seconds
     print(f"[INFO] Print interval: every {print_interval} steps (0.5s)")
+    keyboard_follow_camera = _KeyboardFollowCamera() if args_cli.keyboard else None
 
     # reset environment
     obs = env.get_observations()
+    if keyboard_follow_camera is not None:
+        keyboard_follow_camera.update(env)
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -736,6 +834,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             
             # env stepping
             obs, _, _, _ = env.step(actions)
+            if keyboard_follow_camera is not None:
+                keyboard_follow_camera.update(env)
             
             # print every 0.5 seconds (after step to get processed actions)
             if timestep % print_interval == 0:

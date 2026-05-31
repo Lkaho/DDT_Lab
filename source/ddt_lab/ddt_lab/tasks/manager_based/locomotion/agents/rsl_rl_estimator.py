@@ -160,6 +160,185 @@ def _resolve_velocity_target_groups(obs_groups) -> list[str]:
     return obs_groups.get("privileged", [])
 
 
+def _init_constraint_state(
+    owner,
+    num_costs: int = 0,
+    cost_names: list[str] | tuple[str, ...] | None = None,
+    cost_k_values: list[float] | tuple[float, ...] | float | None = None,
+    cost_d_values: list[float] | tuple[float, ...] | float | None = None,
+    cost_k_growth: float = 1.0004,
+    cost_k_max: float = 1.0,
+    cost_value_loss_coef: float = 1.0,
+    cost_viol_loss_coef: float = 1.0,
+):
+    owner.num_costs = int(num_costs)
+    owner.cost_names = list(cost_names) if cost_names is not None else [f"cost_{idx}" for idx in range(owner.num_costs)]
+    owner.cost_k_growth = float(cost_k_growth)
+    owner.cost_k_max = float(cost_k_max)
+    owner.cost_value_loss_coef = float(cost_value_loss_coef)
+    owner.cost_viol_loss_coef = float(cost_viol_loss_coef)
+    owner._constraint_update_count = 0
+    owner._current_cost_values = None
+    if owner.num_costs <= 0:
+        owner.constraint_k_values = torch.zeros(0, device=owner.device)
+        owner.constraint_d_values = torch.zeros(0, device=owner.device)
+        return
+
+    def _as_cost_tensor(value, default):
+        if value is None:
+            tensor = torch.full((owner.num_costs,), default, dtype=torch.float32, device=owner.device)
+        else:
+            tensor = torch.as_tensor(value, dtype=torch.float32, device=owner.device).flatten()
+            if tensor.numel() == 1:
+                tensor = tensor.repeat(owner.num_costs)
+        if tensor.numel() != owner.num_costs:
+            raise ValueError(f"Expected {owner.num_costs} cost values, got {tensor.numel()}.")
+        return tensor
+
+    owner.constraint_k_values = _as_cost_tensor(cost_k_values, 0.01)
+    owner.constraint_d_values = _as_cost_tensor(cost_d_values, 0.0)
+
+
+def _constraints_enabled(owner) -> bool:
+    return int(getattr(owner, "num_costs", 0)) > 0
+
+
+def _init_cost_storage(owner, num_envs: int, num_transitions_per_env: int, sample_tensor: torch.Tensor):
+    if not _constraints_enabled(owner):
+        return
+    owner.storage.costs = torch.zeros(
+        num_transitions_per_env, num_envs, owner.num_costs, device=owner.device, dtype=sample_tensor.dtype
+    )
+    owner.storage.cost_values = torch.zeros_like(owner.storage.costs)
+    owner.storage.cost_returns = torch.zeros_like(owner.storage.costs)
+    owner.storage.cost_advantages = torch.zeros_like(owner.storage.costs)
+    owner.storage.cost_violation = torch.zeros_like(owner.storage.costs)
+
+
+def _record_cost_values(owner, obs):
+    if _constraints_enabled(owner):
+        owner._current_cost_values = owner.policy.evaluate_cost(obs).detach()
+
+
+def _store_cost_transition(owner, step: int, extras: dict, dones: torch.Tensor):
+    if not _constraints_enabled(owner) or step >= owner.storage.num_transitions_per_env:
+        return
+    costs = extras.get("costs")
+    if costs is None:
+        costs = torch.zeros(owner.storage.num_envs, owner.num_costs, device=owner.device)
+    costs = costs.to(owner.device).view(owner.storage.num_envs, owner.num_costs)
+    if "time_outs" in extras and owner._current_cost_values is not None:
+        time_outs = extras["time_outs"].view(-1, 1).to(owner.device)
+        costs = costs + owner.gamma * owner._current_cost_values * time_outs
+
+    owner.storage.costs[step].copy_(costs)
+    if owner._current_cost_values is None:
+        owner.storage.cost_values[step].zero_()
+    else:
+        owner.storage.cost_values[step].copy_(owner._current_cost_values.to(owner.device))
+    owner._current_cost_values = None
+
+
+def _compute_cost_returns(owner, obs):
+    if not _constraints_enabled(owner):
+        return
+    last_cost_values = owner.policy.evaluate_cost(obs).detach()
+    advantage = 0.0
+    for step in reversed(range(owner.storage.num_transitions_per_env)):
+        next_values = last_cost_values if step == owner.storage.num_transitions_per_env - 1 else owner.storage.cost_values[step + 1]
+        next_is_not_terminal = 1.0 - owner.storage.dones[step].float()
+        delta = owner.storage.costs[step] + next_is_not_terminal * owner.gamma * next_values - owner.storage.cost_values[step]
+        advantage = delta + next_is_not_terminal * owner.gamma * owner.lam * advantage
+        owner.storage.cost_returns[step] = advantage + owner.storage.cost_values[step]
+
+    owner.storage.cost_advantages = owner.storage.cost_returns - owner.storage.cost_values
+    flat_advantages = owner.storage.cost_advantages.flatten(0, 1)
+    cost_adv_mean = flat_advantages.mean(dim=0)
+    cost_adv_std = flat_advantages.std(dim=0).clamp_min(1.0e-8)
+    owner.storage.cost_advantages = (owner.storage.cost_advantages - cost_adv_mean.view(1, 1, -1)) / cost_adv_std.view(1, 1, -1)
+    d_values = owner.constraint_d_values.to(owner.device).view(1, 1, -1)
+    owner.storage.cost_violation = (
+        (1.0 - owner.gamma) * (owner.storage.cost_returns - d_values) + cost_adv_mean.view(1, 1, -1)
+    ) / cost_adv_std.view(1, 1, -1)
+
+
+def _update_constraint_k_values(owner):
+    if not _constraints_enabled(owner):
+        return
+    owner._constraint_update_count += 1
+    owner.constraint_k_values = torch.minimum(
+        torch.full_like(owner.constraint_k_values, owner.cost_k_max),
+        owner.constraint_k_values * (owner.cost_k_growth ** owner._constraint_update_count),
+    )
+
+
+def _compute_constraint_loss(
+    owner,
+    actions_log_prob_batch: torch.Tensor,
+    old_actions_log_prob_batch: torch.Tensor,
+    cost_advantages_batch: torch.Tensor,
+    cost_violation_batch: torch.Tensor,
+) -> torch.Tensor:
+    ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)).view(-1, 1)
+    surrogate = cost_advantages_batch * ratio
+    surrogate_clipped = cost_advantages_batch * torch.clamp(ratio, 1.0 - owner.clip_param, 1.0 + owner.clip_param)
+    cost_surrogate_loss = torch.max(surrogate, surrogate_clipped).mean(dim=0)
+    combined_loss = cost_surrogate_loss + cost_violation_batch.mean(dim=0)
+    return torch.sum(owner.constraint_k_values.to(combined_loss.device) * torch.relu(combined_loss))
+
+
+def _compute_cost_value_loss(owner, target_cost_values_batch, cost_value_batch, cost_returns_batch):
+    if owner.use_clipped_value_loss:
+        cost_value_clipped = target_cost_values_batch + (cost_value_batch - target_cost_values_batch).clamp(
+            -owner.clip_param, owner.clip_param
+        )
+        value_losses = (cost_value_batch - cost_returns_batch).pow(2)
+        value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
+        return torch.max(value_losses, value_losses_clipped).mean()
+    return (cost_returns_batch - cost_value_batch).pow(2).mean()
+
+
+def _constraint_mini_batch_generator(owner):
+    batch_size = owner.storage.num_envs * owner.storage.num_transitions_per_env
+    mini_batch_size = batch_size // owner.num_mini_batches
+    indices = torch.randperm(owner.num_mini_batches * mini_batch_size, requires_grad=False, device=owner.device)
+
+    observations = owner.storage.observations.flatten(0, 1)
+    actions = owner.storage.actions.flatten(0, 1)
+    values = owner.storage.values.flatten(0, 1)
+    returns = owner.storage.returns.flatten(0, 1)
+    old_actions_log_prob = owner.storage.actions_log_prob.flatten(0, 1)
+    advantages = owner.storage.advantages.flatten(0, 1)
+    old_mu = owner.storage.mu.flatten(0, 1)
+    old_sigma = owner.storage.sigma.flatten(0, 1)
+    cost_values = owner.storage.cost_values.flatten(0, 1)
+    cost_returns = owner.storage.cost_returns.flatten(0, 1)
+    cost_advantages = owner.storage.cost_advantages.flatten(0, 1)
+    cost_violation = owner.storage.cost_violation.flatten(0, 1)
+
+    for _ in range(owner.num_learning_epochs):
+        for i in range(owner.num_mini_batches):
+            start = i * mini_batch_size
+            end = (i + 1) * mini_batch_size
+            batch_idx = indices[start:end]
+            yield (
+                observations[batch_idx],
+                actions[batch_idx],
+                values[batch_idx],
+                advantages[batch_idx],
+                returns[batch_idx],
+                old_actions_log_prob[batch_idx],
+                old_mu[batch_idx],
+                old_sigma[batch_idx],
+                (None, None),
+                None,
+                cost_values[batch_idx],
+                cost_advantages[batch_idx],
+                cost_returns[batch_idx],
+                cost_violation[batch_idx],
+            )
+
+
 class DiagnosticActorCritic(ActorCritic):
     """Default actor-critic with light-weight observation sanitization and diagnostics."""
 
@@ -344,6 +523,7 @@ class ActorCriticWithEstimator(nn.Module):
         estimator_target_scale: float | list[float] | tuple[float, ...] = 1.0,
         estimator_feature_scale: float | list[float] | tuple[float, ...] | None = None,
         deploy_share_policy_and_history: bool | None = None,
+        num_costs: int = 0,
         **kwargs,
     ):
         if kwargs:
@@ -396,6 +576,8 @@ class ActorCriticWithEstimator(nn.Module):
         actor_estimator_obs_dim = estimator_output_dim * self.estimated_history_length
         self.actor = MLP(num_actor_obs + actor_estimator_obs_dim, num_actions, actor_hidden_dims, activation)
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
+        self.num_costs = int(num_costs)
+        self.cost_critic = MLP(num_critic_obs, self.num_costs, critic_hidden_dims, activation) if self.num_costs > 0 else None
         self.num_actor_obs = num_actor_obs
         self.num_history_obs = num_history_obs
         self.num_critic_obs = num_critic_obs
@@ -454,6 +636,8 @@ class ActorCriticWithEstimator(nn.Module):
         print(f"Estimator MLP: {self.estimator}")
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
+        if self.cost_critic is not None:
+            print(f"Cost critic MLP: {self.cost_critic}")
 
     def reset(self, dones=None):
         if self._estimated_feature_history.numel() == 0:
@@ -732,6 +916,14 @@ class ActorCriticWithEstimator(nn.Module):
         obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
         return self.critic(obs)
+
+    def evaluate_cost(self, obs, **kwargs):
+        if self.cost_critic is None:
+            batch_size = obs.batch_size[0] if hasattr(obs, "batch_size") else self.get_critic_obs(obs).shape[0]
+            return torch.zeros(batch_size, 0, device=next(self.parameters()).device)
+        obs = self.get_critic_obs(obs)
+        obs = self.critic_obs_normalizer(obs)
+        return torch.nn.functional.softplus(self.cost_critic(obs))
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
@@ -1187,6 +1379,7 @@ class ActorCriticWithCENet(nn.Module):
         cenet_velocity_dim: int = 3,
         cenet_latent_dim: int = 16,
         num_history: int = 5,
+        num_costs: int = 0,
         **kwargs,
     ):
         if kwargs:
@@ -1232,6 +1425,8 @@ class ActorCriticWithCENet(nn.Module):
 
         self.actor = MLP(num_actor_obs + cenet_velocity_dim + cenet_latent_dim, num_actions, actor_hidden_dims, activation)
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
+        self.num_costs = int(num_costs)
+        self.cost_critic = MLP(num_critic_obs, self.num_costs, critic_hidden_dims, activation) if self.num_costs > 0 else None
         self.num_actor_obs = num_actor_obs
         self.num_history_obs = num_history_obs
         self.num_critic_obs = num_critic_obs
@@ -1268,6 +1463,8 @@ class ActorCriticWithCENet(nn.Module):
         print(f"CENet decoder: {self.cenet_decoder}")
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
+        if self.cost_critic is not None:
+            print(f"Cost critic MLP: {self.cost_critic}")
 
     @property
     def action_mean(self):
@@ -1443,6 +1640,14 @@ class ActorCriticWithCENet(nn.Module):
         obs = self.critic_obs_normalizer(obs)
         return self.critic(obs)
 
+    def evaluate_cost(self, obs, **kwargs):
+        if self.cost_critic is None:
+            batch_size = obs.batch_size[0] if hasattr(obs, "batch_size") else self.get_critic_obs(obs).shape[0]
+            return torch.zeros(batch_size, 0, device=next(self.parameters()).device)
+        obs = self.get_critic_obs(obs)
+        obs = self.critic_obs_normalizer(obs)
+        return torch.nn.functional.softplus(self.cost_critic(obs))
+
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
@@ -1540,6 +1745,69 @@ class CENetActorDeployWrapper(nn.Module):
         return self.actor(actor_obs), mean_vel
 
 
+class CENetEncoderDeployWrapper(nn.Module):
+    """CENet encoder-only deploy wrapper with explicit history input."""
+
+    def __init__(self, policy: ActorCriticWithCENet):
+        super().__init__()
+        self.cenet_encoder = copy.deepcopy(policy.cenet_encoder)
+        self.history_obs_dim = int(policy.num_history_obs)
+        self.encoder_output_dim = int(policy.cenet_mean_vel.in_features)
+
+    @property
+    def input_dim(self) -> int:
+        return self.history_obs_dim
+
+    @property
+    def output_dim(self) -> int:
+        return self.encoder_output_dim
+
+    def forward(self, history_obs: torch.Tensor) -> torch.Tensor:
+        return self.cenet_encoder(history_obs)
+
+
+class CENetMeanHeadDeployWrapper(nn.Module):
+    """CENet mean head deploy wrapper for velocity or latent outputs."""
+
+    def __init__(self, mean_head: nn.Module, input_dim: int, output_dim: int):
+        super().__init__()
+        self.mean_head = copy.deepcopy(mean_head)
+        self._input_dim = int(input_dim)
+        self._output_dim = int(output_dim)
+
+    @property
+    def input_dim(self) -> int:
+        return self._input_dim
+
+    @property
+    def output_dim(self) -> int:
+        return self._output_dim
+
+    def forward(self, encoder_feature: torch.Tensor) -> torch.Tensor:
+        return self.mean_head(encoder_feature)
+
+
+class CENetSplitActorDeployWrapper(nn.Module):
+    """Actor deploy wrapper with externally supplied deterministic CENet mean code."""
+
+    def __init__(self, policy: ActorCriticWithCENet):
+        super().__init__()
+        self.actor = copy.deepcopy(policy.actor)
+        self.actor_obs_normalizer = copy.deepcopy(policy.actor_obs_normalizer)
+        self.policy_obs_dim = int(policy.num_actor_obs)
+        self.cenet_velocity_dim = int(policy.cenet_velocity_dim)
+        self.cenet_latent_dim = int(policy.cenet_latent_dim)
+        self.num_actions = int(policy.num_actions)
+
+    @property
+    def input_dim(self) -> int:
+        return self.policy_obs_dim + self.cenet_velocity_dim + self.cenet_latent_dim
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        actor_obs = self.actor_obs_normalizer(obs)
+        return self.actor(actor_obs)
+
+
 def is_cenet_policy(policy: nn.Module) -> bool:
     return isinstance(policy, ActorCriticWithCENet)
 
@@ -1564,6 +1832,63 @@ def get_cenet_deploy_metadata(policy: ActorCriticWithCENet) -> dict[str, object]
     }
 
 
+def get_split_cenet_deploy_metadata(policy: ActorCriticWithCENet) -> dict[str, object]:
+    encoder_wrapper = CENetEncoderDeployWrapper(policy)
+    vel_mu_wrapper = CENetMeanHeadDeployWrapper(
+        policy.cenet_mean_vel, encoder_wrapper.output_dim, policy.cenet_velocity_dim
+    )
+    latent_mu_wrapper = CENetMeanHeadDeployWrapper(
+        policy.cenet_mean_latent, encoder_wrapper.output_dim, policy.cenet_latent_dim
+    )
+    actor_wrapper = CENetSplitActorDeployWrapper(policy)
+    return {
+        "type": "split_cenet_actor_deploy",
+        "inference_mode": "deterministic_mean_only",
+        "policy_obs_dim": actor_wrapper.policy_obs_dim,
+        "history_obs_dim": encoder_wrapper.history_obs_dim,
+        "encoder_output_dim": encoder_wrapper.output_dim,
+        "cenet_velocity_dim": actor_wrapper.cenet_velocity_dim,
+        "cenet_latent_dim": actor_wrapper.cenet_latent_dim,
+        "num_actions": actor_wrapper.num_actions,
+        "num_history": policy.num_history,
+        "obs_groups": policy.obs_groups,
+        "data_flow": "history_obs->encoder->vel_mu/latent_mu; policy_obs+estimated_velocity+latent_mean->actor",
+        "exported_files": {
+            "encoder": {"torchscript": "cenet_encoder.pt", "onnx": "cenet_encoder.onnx"},
+            "velocity_mean_head": {"torchscript": "cenet_vel_mu.pt", "onnx": "cenet_vel_mu.onnx"},
+            "latent_mean_head": {"torchscript": "cenet_latent_mu.pt", "onnx": "cenet_latent_mu.onnx"},
+            "actor": {"torchscript": "cenet_actor.pt", "onnx": "cenet_actor.onnx"},
+        },
+        "encoder": {
+            "input_name": "history_obs",
+            "output_name": "encoder_feature",
+            "input_dim": encoder_wrapper.input_dim,
+            "output_dim": encoder_wrapper.output_dim,
+        },
+        "velocity_mean_head": {
+            "input_name": "encoder_feature",
+            "output_name": "estimated_velocity",
+            "input_dim": vel_mu_wrapper.input_dim,
+            "output_dim": vel_mu_wrapper.output_dim,
+            "output_units": "base_lin_vel",
+        },
+        "latent_mean_head": {
+            "input_name": "encoder_feature",
+            "output_name": "latent_mean",
+            "input_dim": latent_mu_wrapper.input_dim,
+            "output_dim": latent_mu_wrapper.output_dim,
+        },
+        "actor": {
+            "input_name": "actor_obs",
+            "output_name": "actions",
+            "input_dim": actor_wrapper.input_dim,
+            "output_dim": actor_wrapper.num_actions,
+            "input_layout": "policy_obs_then_estimated_velocity_then_latent_mean",
+            "normalization": "actor_obs_normalizer_inside_exported_actor",
+        },
+    }
+
+
 def export_cenet_policy_metadata(
     policy: ActorCriticWithCENet, path: str, filename: str = "policy_metadata.json"
 ) -> None:
@@ -1571,6 +1896,15 @@ def export_cenet_policy_metadata(
     export_path = os.path.join(path, filename)
     with open(export_path, "w", encoding="utf-8") as f:
         json.dump(get_cenet_deploy_metadata(policy), f, indent=2)
+
+
+def export_split_cenet_policy_metadata(
+    policy: ActorCriticWithCENet, path: str, filename: str = "policy_split_metadata.json"
+) -> None:
+    os.makedirs(path, exist_ok=True)
+    export_path = os.path.join(path, filename)
+    with open(export_path, "w", encoding="utf-8") as f:
+        json.dump(get_split_cenet_deploy_metadata(policy), f, indent=2)
 
 
 def export_cenet_policy_as_jit(policy: ActorCriticWithCENet, path: str, filename: str = "policy.pt") -> None:
@@ -1606,6 +1940,92 @@ def export_cenet_policy_as_onnx(
         output_names=["actions", "estimated_velocity"],
         dynamic_axes={},
     )
+
+
+def export_split_cenet_policy_as_jit(policy: ActorCriticWithCENet, path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+    encoder_wrapper = CENetEncoderDeployWrapper(policy)
+    vel_mu_wrapper = CENetMeanHeadDeployWrapper(
+        policy.cenet_mean_vel, encoder_wrapper.output_dim, policy.cenet_velocity_dim
+    )
+    latent_mu_wrapper = CENetMeanHeadDeployWrapper(
+        policy.cenet_mean_latent, encoder_wrapper.output_dim, policy.cenet_latent_dim
+    )
+    actor_wrapper = CENetSplitActorDeployWrapper(policy)
+
+    wrappers_and_examples = [
+        ("cenet_encoder.pt", encoder_wrapper, torch.zeros(1, encoder_wrapper.input_dim)),
+        ("cenet_vel_mu.pt", vel_mu_wrapper, torch.zeros(1, vel_mu_wrapper.input_dim)),
+        ("cenet_latent_mu.pt", latent_mu_wrapper, torch.zeros(1, latent_mu_wrapper.input_dim)),
+        ("cenet_actor.pt", actor_wrapper, torch.zeros(1, actor_wrapper.input_dim)),
+    ]
+    for filename, wrapper, example_input in wrappers_and_examples:
+        wrapper.to("cpu")
+        wrapper.eval()
+        traced_module = torch.jit.trace(wrapper, example_input)
+        traced_module.save(os.path.join(path, filename))
+
+
+def export_split_cenet_policy_as_onnx(
+    policy: ActorCriticWithCENet,
+    path: str,
+    verbose: bool = False,
+    opset_version: int = 18,
+) -> None:
+    os.makedirs(path, exist_ok=True)
+    encoder_wrapper = CENetEncoderDeployWrapper(policy)
+    vel_mu_wrapper = CENetMeanHeadDeployWrapper(
+        policy.cenet_mean_vel, encoder_wrapper.output_dim, policy.cenet_velocity_dim
+    )
+    latent_mu_wrapper = CENetMeanHeadDeployWrapper(
+        policy.cenet_mean_latent, encoder_wrapper.output_dim, policy.cenet_latent_dim
+    )
+    actor_wrapper = CENetSplitActorDeployWrapper(policy)
+
+    export_specs = [
+        (
+            "cenet_encoder.onnx",
+            encoder_wrapper,
+            torch.zeros(1, encoder_wrapper.input_dim),
+            ["history_obs"],
+            ["encoder_feature"],
+        ),
+        (
+            "cenet_vel_mu.onnx",
+            vel_mu_wrapper,
+            torch.zeros(1, vel_mu_wrapper.input_dim),
+            ["encoder_feature"],
+            ["estimated_velocity"],
+        ),
+        (
+            "cenet_latent_mu.onnx",
+            latent_mu_wrapper,
+            torch.zeros(1, latent_mu_wrapper.input_dim),
+            ["encoder_feature"],
+            ["latent_mean"],
+        ),
+        (
+            "cenet_actor.onnx",
+            actor_wrapper,
+            torch.zeros(1, actor_wrapper.input_dim),
+            ["actor_obs"],
+            ["actions"],
+        ),
+    ]
+    for filename, wrapper, example_input, input_names, output_names in export_specs:
+        wrapper.to("cpu")
+        wrapper.eval()
+        torch.onnx.export(
+            wrapper,
+            example_input,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=opset_version,
+            verbose=verbose,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes={},
+        )
 
 
 def _patch_on_policy_runner_checkpointing(on_policy_runner_module) -> None:
@@ -1653,6 +2073,14 @@ class PPOWithCENetAdaBoot(PPO):
         adaboot_reward_window: int = 128,
         adaboot_min_episodes: int = 32,
         adaboot_eps: float = 1.0e-6,
+        num_costs: int = 0,
+        cost_names: list[str] | tuple[str, ...] | None = None,
+        cost_k_values: list[float] | tuple[float, ...] | float | None = None,
+        cost_d_values: list[float] | tuple[float, ...] | float | None = None,
+        cost_k_growth: float = 1.0004,
+        cost_k_max: float = 1.0,
+        cost_value_loss_coef: float = 1.0,
+        cost_viol_loss_coef: float = 1.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -1676,6 +2104,17 @@ class PPOWithCENetAdaBoot(PPO):
         self._current_actor_velocity_code = None
         self.adaboot_probability = 0.0
         self.adaboot_cv = 0.0
+        _init_constraint_state(
+            self,
+            num_costs=num_costs,
+            cost_names=cost_names,
+            cost_k_values=cost_k_values,
+            cost_d_values=cost_d_values,
+            cost_k_growth=cost_k_growth,
+            cost_k_max=cost_k_max,
+            cost_value_loss_coef=cost_value_loss_coef,
+            cost_viol_loss_coef=cost_viol_loss_coef,
+        )
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
         super().init_storage(training_type, num_envs, num_transitions_per_env, obs, actions_shape)
@@ -1701,6 +2140,7 @@ class PPOWithCENetAdaBoot(PPO):
             device=self.device,
             dtype=sample_tensor.dtype,
         )
+        _init_cost_storage(self, num_envs, num_transitions_per_env, sample_tensor)
 
     def _compute_cenet_total_loss(self, cenet_losses: dict[str, torch.Tensor]) -> torch.Tensor:
         return self.cenet_loss_coef * (
@@ -1733,11 +2173,16 @@ class PPOWithCENetAdaBoot(PPO):
             "vae_learning_rate": self.vae_learning_rate,
             "rl_grad_to_cenet": self.rl_grad_to_cenet,
             "num_vae_substeps": self.num_vae_substeps,
+            "constraint_k_values": self.constraint_k_values.detach().cpu() if _constraints_enabled(self) else None,
+            "constraint_update_count": self._constraint_update_count,
         }
 
     def load_extra_checkpoint_state(self, loaded_dict: dict[str, object], load_optimizer: bool = True) -> None:
         if load_optimizer and "vae_optimizer_state_dict" in loaded_dict:
             self.vae_optimizer.load_state_dict(loaded_dict["vae_optimizer_state_dict"])
+        if _constraints_enabled(self) and loaded_dict.get("constraint_k_values") is not None:
+            self.constraint_k_values = loaded_dict["constraint_k_values"].to(self.device)
+            self._constraint_update_count = int(loaded_dict.get("constraint_update_count", self._constraint_update_count))
 
     def _ensure_episode_return_buffer(self, num_envs: int, device: torch.device):
         if self._episode_returns is None or self._episode_returns.numel() != num_envs:
@@ -1793,6 +2238,7 @@ class PPOWithCENetAdaBoot(PPO):
         if self._current_actor_velocity_code is not None:
             self._current_actor_velocity_code = self._current_actor_velocity_code.detach()
         self.transition.values = self.policy.evaluate(obs).detach()
+        _record_cost_values(self, obs)
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -1827,12 +2273,17 @@ class PPOWithCENetAdaBoot(PPO):
                 self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
 
+        _store_cost_transition(self, self.storage.step, extras, dones)
         self._update_episode_returns(rewards, dones)
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
         self._current_bootstrap_mask = None
         self._current_actor_velocity_code = None
+
+    def compute_returns(self, obs):
+        super().compute_returns(obs)
+        _compute_cost_returns(self, obs)
 
     def _mini_batch_generator_with_cenet(self):
         batch_size = self.storage.num_envs * self.storage.num_transitions_per_env
@@ -1851,6 +2302,11 @@ class PPOWithCENetAdaBoot(PPO):
         bootstrap_masks = self._cenet_bootstrap_masks.flatten(0, 1)
         actor_velocity_codes = self._cenet_actor_velocity_codes.flatten(0, 1)
         dones = self.storage.dones.flatten(0, 1)
+        if _constraints_enabled(self):
+            cost_values = self.storage.cost_values.flatten(0, 1)
+            cost_returns = self.storage.cost_returns.flatten(0, 1)
+            cost_advantages = self.storage.cost_advantages.flatten(0, 1)
+            cost_violation = self.storage.cost_violation.flatten(0, 1)
 
         for _ in range(self.num_learning_epochs):
             for i in range(self.num_mini_batches):
@@ -1870,6 +2326,10 @@ class PPOWithCENetAdaBoot(PPO):
                     bootstrap_masks[batch_idx],
                     actor_velocity_codes[batch_idx],
                     dones[batch_idx],
+                    cost_values[batch_idx] if _constraints_enabled(self) else None,
+                    cost_advantages[batch_idx] if _constraints_enabled(self) else None,
+                    cost_returns[batch_idx] if _constraints_enabled(self) else None,
+                    cost_violation[batch_idx] if _constraints_enabled(self) else None,
                 )
 
     def update(self):  # noqa: C901
@@ -1883,7 +2343,10 @@ class PPOWithCENetAdaBoot(PPO):
         mean_cenet_reconstruction_loss = 0
         mean_cenet_kl_loss = 0
         mean_cenet_total_loss = 0
+        mean_cost_value_loss = 0
+        mean_constraint_violation_loss = 0
         mean_rnd_loss = 0 if self.rnd else None
+        _update_constraint_k_values(self)
 
         for (
             obs_batch,
@@ -1898,6 +2361,10 @@ class PPOWithCENetAdaBoot(PPO):
             bootstrap_mask_batch,
             actor_velocity_code_batch,
             dones_batch,
+            target_cost_values_batch,
+            cost_advantages_batch,
+            cost_returns_batch,
+            cost_violation_batch,
         ) in self._mini_batch_generator_with_cenet():
             original_batch_size = obs_batch.batch_size[0]
 
@@ -1915,6 +2382,20 @@ class PPOWithCENetAdaBoot(PPO):
             )
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(obs_batch)
+            cost_value_loss = torch.zeros((), device=self.device)
+            constraint_violation_loss = torch.zeros((), device=self.device)
+            if _constraints_enabled(self):
+                cost_value_batch = self.policy.evaluate_cost(obs_batch)
+                cost_value_loss = _compute_cost_value_loss(
+                    self, target_cost_values_batch, cost_value_batch, cost_returns_batch
+                )
+                constraint_violation_loss = _compute_constraint_loss(
+                    self,
+                    actions_log_prob_batch,
+                    old_actions_log_prob_batch,
+                    cost_advantages_batch,
+                    cost_violation_batch,
+                )
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
@@ -1964,6 +2445,8 @@ class PPOWithCENetAdaBoot(PPO):
             ppo_loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
+                + self.cost_value_loss_coef * cost_value_loss
+                + self.cost_viol_loss_coef * constraint_violation_loss
                 - self.entropy_coef * entropy_batch.mean()
             )
 
@@ -2023,6 +2506,8 @@ class PPOWithCENetAdaBoot(PPO):
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            mean_cost_value_loss += cost_value_loss.item()
+            mean_constraint_violation_loss += constraint_violation_loss.item()
             mean_cenet_velocity_loss += cenet_losses["velocity"].item()
             mean_cenet_reconstruction_loss += cenet_losses["reconstruction"].item()
             mean_cenet_kl_loss += cenet_losses["kl"].item()
@@ -2038,6 +2523,8 @@ class PPOWithCENetAdaBoot(PPO):
         mean_cenet_reconstruction_loss /= num_updates
         mean_cenet_kl_loss /= num_updates
         mean_cenet_total_loss /= num_updates
+        mean_cost_value_loss /= num_updates
+        mean_constraint_violation_loss /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
 
@@ -2051,9 +2538,14 @@ class PPOWithCENetAdaBoot(PPO):
             "cenet_reconstruction": mean_cenet_reconstruction_loss,
             "cenet_kl": mean_cenet_kl_loss,
             "cenet_total": mean_cenet_total_loss,
+            "cost_value": mean_cost_value_loss,
+            "constraint_violation": mean_constraint_violation_loss,
             "adaboot_probability": self.adaboot_probability,
             "adaboot_cv": self.adaboot_cv,
         }
+        if _constraints_enabled(self):
+            for idx, name in enumerate(self.cost_names):
+                loss_dict[f"constraint_k/{name}"] = float(self.constraint_k_values[idx].detach().cpu())
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         return loss_dict
@@ -2062,10 +2554,35 @@ class PPOWithCENetAdaBoot(PPO):
 class PPOWithEstimator(PPO):
     """PPO with an auxiliary supervised loss for the history-based estimator."""
 
-    def __init__(self, *args, estimator_loss_coef: float = 1.0, estimator_lr: float | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        estimator_loss_coef: float = 1.0,
+        estimator_lr: float | None = None,
+        num_costs: int = 0,
+        cost_names: list[str] | tuple[str, ...] | None = None,
+        cost_k_values: list[float] | tuple[float, ...] | float | None = None,
+        cost_d_values: list[float] | tuple[float, ...] | float | None = None,
+        cost_k_growth: float = 1.0004,
+        cost_k_max: float = 1.0,
+        cost_value_loss_coef: float = 1.0,
+        cost_viol_loss_coef: float = 1.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.estimator_loss_coef = estimator_loss_coef
         self.estimator_lr = estimator_lr
+        _init_constraint_state(
+            self,
+            num_costs=num_costs,
+            cost_names=cost_names,
+            cost_k_values=cost_k_values,
+            cost_d_values=cost_d_values,
+            cost_k_growth=cost_k_growth,
+            cost_k_max=cost_k_max,
+            cost_value_loss_coef=cost_value_loss_coef,
+            cost_viol_loss_coef=cost_viol_loss_coef,
+        )
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
         obs_with_estimator_features = {key: value for key, value in obs.items()}
@@ -2077,6 +2594,12 @@ class PPOWithEstimator(PPO):
             dtype=sample_tensor.dtype,
         )
         super().init_storage(training_type, num_envs, num_transitions_per_env, obs_with_estimator_features, actions_shape)
+        _init_cost_storage(self, num_envs, num_transitions_per_env, sample_tensor)
+
+    def act(self, obs):
+        actions = super().act(obs)
+        _record_cost_values(self, obs)
+        return actions
 
     def process_env_step(self, obs, rewards, dones, extras):
         # Reset estimator history before processing the next observation so reset envs start clean.
@@ -2098,18 +2621,39 @@ class PPOWithEstimator(PPO):
                 self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
 
+        _store_cost_transition(self, self.storage.step, extras, dones)
         self.storage.add_transitions(self.transition)
         self.transition.clear()
+
+    def compute_returns(self, obs):
+        super().compute_returns(obs)
+        _compute_cost_returns(self, obs)
+
+    def get_extra_checkpoint_state(self) -> dict[str, object]:
+        return {
+            "constraint_k_values": self.constraint_k_values.detach().cpu() if _constraints_enabled(self) else None,
+            "constraint_update_count": self._constraint_update_count,
+        }
+
+    def load_extra_checkpoint_state(self, loaded_dict: dict[str, object], load_optimizer: bool = True) -> None:
+        if _constraints_enabled(self) and loaded_dict.get("constraint_k_values") is not None:
+            self.constraint_k_values = loaded_dict["constraint_k_values"].to(self.device)
+            self._constraint_update_count = int(loaded_dict.get("constraint_update_count", self._constraint_update_count))
 
     def update(self):  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_estimator_loss = 0
+        mean_cost_value_loss = 0
+        mean_constraint_violation_loss = 0
         mean_rnd_loss = 0 if self.rnd else None
         mean_symmetry_loss = 0 if self.symmetry else None
 
-        if self.policy.is_recurrent:
+        _update_constraint_k_values(self)
+        if _constraints_enabled(self):
+            generator = _constraint_mini_batch_generator(self)
+        elif self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -2127,7 +2671,20 @@ class PPOWithEstimator(PPO):
             old_sigma_batch,
             hid_states_batch,
             masks_batch,
+            *cost_batch,
         ) in generator:
+            if cost_batch:
+                (
+                    target_cost_values_batch,
+                    cost_advantages_batch,
+                    cost_returns_batch,
+                    cost_violation_batch,
+                ) = cost_batch
+            else:
+                target_cost_values_batch = None
+                cost_advantages_batch = None
+                cost_returns_batch = None
+                cost_violation_batch = None
             num_aug = 1
             original_batch_size = obs_batch.batch_size[0]
 
@@ -2151,6 +2708,20 @@ class PPOWithEstimator(PPO):
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            cost_value_loss = torch.zeros((), device=self.device)
+            constraint_violation_loss = torch.zeros((), device=self.device)
+            if _constraints_enabled(self):
+                cost_value_batch = self.policy.evaluate_cost(obs_batch)
+                cost_value_loss = _compute_cost_value_loss(
+                    self, target_cost_values_batch, cost_value_batch, cost_returns_batch
+                )
+                constraint_violation_loss = _compute_constraint_loss(
+                    self,
+                    actions_log_prob_batch,
+                    old_actions_log_prob_batch,
+                    cost_advantages_batch,
+                    cost_violation_batch,
+                )
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
@@ -2197,7 +2768,13 @@ class PPOWithEstimator(PPO):
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            loss = (
+                surrogate_loss
+                + self.value_loss_coef * value_loss
+                + self.cost_value_loss_coef * cost_value_loss
+                + self.cost_viol_loss_coef * constraint_violation_loss
+                - self.entropy_coef * entropy_batch.mean()
+            )
 
             estimator_loss = torch.zeros((), device=self.device)
             if self.policy.velocity_target_groups:
@@ -2251,6 +2828,8 @@ class PPOWithEstimator(PPO):
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
             mean_estimator_loss += estimator_loss.item()
+            mean_cost_value_loss += cost_value_loss.item()
+            mean_constraint_violation_loss += constraint_violation_loss.item()
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
             if mean_symmetry_loss is not None:
@@ -2261,6 +2840,8 @@ class PPOWithEstimator(PPO):
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_estimator_loss /= num_updates
+        mean_cost_value_loss /= num_updates
+        mean_constraint_violation_loss /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -2273,7 +2854,12 @@ class PPOWithEstimator(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "estimator": mean_estimator_loss,
+            "cost_value": mean_cost_value_loss,
+            "constraint_violation": mean_constraint_violation_loss,
         }
+        if _constraints_enabled(self):
+            for idx, name in enumerate(self.cost_names):
+                loss_dict[f"constraint_k/{name}"] = float(self.constraint_k_values[idx].detach().cpu())
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -2349,6 +2935,7 @@ class PPOWithEstimatorAdaBoot(PPOWithEstimator):
 
         self.transition.actions = self.policy.act(obs, bootstrap_mask=estimated_velocity_mask).detach()
         self.transition.values = self.policy.evaluate(obs).detach()
+        _record_cost_values(self, obs)
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -2378,6 +2965,7 @@ class PPOWithEstimatorAdaBoot(PPOWithEstimator):
                 self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
 
+        _store_cost_transition(self, self.storage.step, extras, dones)
         self.storage.add_transitions(self.transition)
         self.transition.clear()
 

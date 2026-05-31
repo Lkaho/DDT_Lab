@@ -53,11 +53,11 @@ DDT_TITA_CFG = ArticulationCfg(
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.40),
         joint_pos={
-            "joint_left_leg_1": 0.0,
+            "joint_left_leg_1": -0.1,
             "joint_left_leg_2": 0.8,
             "joint_left_leg_3": -1.5,
             "joint_left_leg_4": 0.0,
-            "joint_right_leg_1": 0.0,
+            "joint_right_leg_1": 0.1,
             "joint_right_leg_2": 0.8,
             "joint_right_leg_3": -1.5,
             "joint_right_leg_4": 0.0,

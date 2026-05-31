@@ -44,7 +44,7 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
         self._ff_period = cfg.feedforward_period
         self._contact_trigger_enabled = cfg.contact_trigger_enabled
         self._force_threshold = cfg.contact_force_threshold
-        self._followup_trigger_delay = cfg.followup_trigger_delay_factor * self._ff_period
+        self._inter_leg_phase_lag_time = cfg.inter_leg_phase_lag * self._ff_period
         self._k_ff_anneal_enabled = cfg.k_ff_anneal_enabled
         self._k_ff_final = cfg.k_ff_final
         self._k_ff_start_iteration = cfg.k_ff_start_iteration
@@ -294,13 +294,13 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
             (self._first_leg == _FIRST_RIGHT_LEG)
             & self._lifting_state[:, _RIGHT_LEG_INDEX]
             & ~self._lifting_state[:, _LEFT_LEG_INDEX]
-            & (self._time[:, _RIGHT_LEG_INDEX] >= self._followup_trigger_delay)
+            & (self._time[:, _RIGHT_LEG_INDEX] >= self._inter_leg_phase_lag_time)
         )
         right_followup_ready = (
             (self._first_leg == _FIRST_LEFT_LEG)
             & self._lifting_state[:, _LEFT_LEG_INDEX]
             & ~self._lifting_state[:, _RIGHT_LEG_INDEX]
-            & (self._time[:, _LEFT_LEG_INDEX] >= self._followup_trigger_delay)
+            & (self._time[:, _LEFT_LEG_INDEX] >= self._inter_leg_phase_lag_time)
         )
         can_trigger_left = ~self._lifting_state[:, _LEFT_LEG_INDEX] & (no_leg_lifting | left_followup_ready)
         can_trigger_right = ~self._lifting_state[:, _RIGHT_LEG_INDEX] & (no_leg_lifting | right_followup_ready)
@@ -387,7 +387,7 @@ class JointPositionWithFeedforwardActionCfg(ActionTermCfg):
     contact_sensor_name: str = "contact_forces"
     contact_body_pattern: str = ".*_leg_4"
     contact_force_threshold: float = 10.0
-    followup_trigger_delay_factor: float = 0.0
+    inter_leg_phase_lag: float = 0.0
     k_ff_anneal_enabled: bool = False
     k_ff_final: float = 0.0
     k_ff_start_iteration: int = 0
@@ -495,7 +495,7 @@ class TitaJointPositionEffortAction(ActionTerm):
         self._ff_period = cfg.feedforward_period
         self._contact_trigger_enabled = cfg.contact_trigger_enabled
         self._force_threshold = cfg.contact_force_threshold
-        self._followup_trigger_delay = cfg.followup_trigger_delay_factor * self._ff_period
+        self._inter_leg_phase_lag_time = cfg.inter_leg_phase_lag * self._ff_period
         self._k_ff_anneal_enabled = cfg.k_ff_anneal_enabled
         self._k_ff_final = cfg.k_ff_final
         self._k_ff_start_iteration = cfg.k_ff_start_iteration
@@ -841,13 +841,13 @@ class TitaJointPositionEffortAction(ActionTerm):
             (self._first_leg == _FIRST_RIGHT_LEG)
             & self._lifting_state[:, _RIGHT_LEG_INDEX]
             & ~self._lifting_state[:, _LEFT_LEG_INDEX]
-            & (self._time[:, _RIGHT_LEG_INDEX] >= self._followup_trigger_delay)
+            & (self._time[:, _RIGHT_LEG_INDEX] >= self._inter_leg_phase_lag_time)
         )
         right_followup_ready = (
             (self._first_leg == _FIRST_LEFT_LEG)
             & self._lifting_state[:, _LEFT_LEG_INDEX]
             & ~self._lifting_state[:, _RIGHT_LEG_INDEX]
-            & (self._time[:, _LEFT_LEG_INDEX] >= self._followup_trigger_delay)
+            & (self._time[:, _LEFT_LEG_INDEX] >= self._inter_leg_phase_lag_time)
         )
         can_trigger_left = ~self._lifting_state[:, _LEFT_LEG_INDEX] & (no_leg_lifting | left_followup_ready)
         can_trigger_right = ~self._lifting_state[:, _RIGHT_LEG_INDEX] & (no_leg_lifting | right_followup_ready)
@@ -1033,7 +1033,7 @@ class TitaJointPositionEffortActionCfg(ActionTermCfg):
     contact_sensor_name: str = "contact_forces"
     contact_body_pattern: str = ".*_leg_4"
     contact_force_threshold: float = 10.0
-    followup_trigger_delay_factor: float = 0.0
+    inter_leg_phase_lag: float = 0.0
     k_ff_anneal_enabled: bool = False
     k_ff_final: float = 0.0
     k_ff_start_iteration: int = 0

@@ -8,6 +8,7 @@ import math
 import ddt_lab.tasks.manager_based.locomotion.mdp as mdp
 import isaaclab.sim as sim_utils
 import torch
+from ddt_lab.managers import CostTermCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -116,9 +117,9 @@ class ActionsCfg:
             "joint_right_leg_3",
         ],
         wheel_joint_names=["joint_left_leg_4", "joint_right_leg_4"],
-        leg_scale=(0.25, 0.5, 0.5, 0.25, 0.5, 0.5),
-        wheel_scale=0.5,
-        wheel_effort_gain=12.0,
+        leg_scale=(0.25, 0.25, 0.25, 0.25, 0.25, 0.25),
+        wheel_scale=5.0,
+        wheel_effort_gain=0.0,
         wheel_offset=0.0,
         use_default_leg_offset=True,
         preserve_order=True,
@@ -127,8 +128,8 @@ class ActionsCfg:
 
 
 @configclass
-class ObservationsCfg:
-    """Observation specifications for the MDP."""
+class BaseObservationsCfg:
+    """Shared rough-base observations; canonical tasks override this for MlpEstimator or DreamWaQ."""
 
     @configclass
     class PolicyCfg(ObsGroup):
@@ -199,6 +200,21 @@ class ObservationsCfg:
             scale=0.05,
         )
         actions = ObsTerm(func=mdp.last_action, scale=1.0)
+        contact_state = ObsTerm(
+            func=mdp.contact_state,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"])},
+            scale=1.0,
+        )
+        joint_kp_factor = ObsTerm(
+            func=mdp.joint_kp_factor,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+            scale=1.0,
+        )
+        joint_kd_factor = ObsTerm(
+            func=mdp.joint_kd_factor,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+            scale=1.0,
+        )
 
         def __post_init__(self):
             self.history_length = 1
@@ -286,10 +302,10 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=3.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
-    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_exp, weight=2.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
+    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=2.2, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
+    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_exp, weight=1.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
-    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.5)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.1)
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
@@ -311,11 +327,11 @@ class RewardsCfg:
     joint_deviation_legs_l1 = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[23]"])},
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"])},
     )
     stand_still = RewTerm(
         func=mdp.stand_still,
-        weight=-0.1,
+        weight=-0.5,
         params={"command_name": "base_velocity", "command_threshold": 0.1, "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"])},
     )
     undesired_contacts = RewTerm(
@@ -323,11 +339,11 @@ class RewardsCfg:
         weight=-10.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_2", ".*_leg_3"]), "threshold": 1.0},
     )
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-20.0)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-8.0)
     base_height_l2 = RewTerm(func=mdp.base_height_l2, weight=-10.0, params={"target_height": 0.33})
     opposite_wheel_vel = RewTerm(
     func=mdp.opposite_wheel_vel,
-    weight=-2.0,
+    weight=-1.0,
     params={
         "command_name": "base_velocity",
         "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
@@ -354,17 +370,45 @@ class CurriculumCfg:
 
 
 @configclass
+class CostsCfg:
+    """Constraint costs for Tita locomotion."""
+
+    joint_pos_limit = CostTermCfg(
+        func=mdp.joint_pos_limit,
+        scale=1.0,
+        d_value=0.0,
+        k_value=0.01,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"])},
+    )
+    joint_vel_limit = CostTermCfg(
+        func=mdp.joint_vel_limit,
+        scale=1.0,
+        d_value=0.0,
+        k_value=0.01,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+    )
+    joint_torque_limit = CostTermCfg(
+        func=mdp.joint_torque_limit,
+        scale=1.0,
+        d_value=0.0,
+        k_value=0.01,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+    )
+
+
+@configclass
 class TitaRoughEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the locomotion velocity-tracking environment."""
 
     scene: SceneCfg = SceneCfg(num_envs=4096, env_spacing=2.5)
-    observations: ObservationsCfg = ObservationsCfg()
+    observations: BaseObservationsCfg = BaseObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
+    costs: CostsCfg = CostsCfg()
     only_positive_rewards: bool = False
 
     def __post_init__(self):
@@ -398,19 +442,3 @@ def configure_forward_only_play_commands(env_cfg, lin_vel_x_range: tuple[float, 
     if hasattr(base_velocity, "restricted_lin_vel_x_range"):
         base_velocity.restricted_lin_vel_x_range = lin_vel_x_range
 
-
-@configclass
-class TitaRoughEnvCfg_PLAY(TitaRoughEnvCfg):
-    def __post_init__(self):
-        super().__post_init__()
-        configure_forward_only_play_commands(self)
-        self.scene.num_envs = 50
-        self.scene.env_spacing = 2.5
-        self.scene.terrain.max_init_terrain_level = None
-        if self.scene.terrain.terrain_generator is not None:
-            self.scene.terrain.terrain_generator.num_rows = 5
-            self.scene.terrain.terrain_generator.num_cols = 5
-            self.scene.terrain.terrain_generator.curriculum = False
-        self.observations.policy.enable_corruption = False
-        self.events.base_external_force_torque = None
-        self.events.push_robot = None

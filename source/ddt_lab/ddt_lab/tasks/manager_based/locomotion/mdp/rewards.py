@@ -1098,8 +1098,9 @@ def feet_xy_swing_fz_stance_match(
     score = match.float().sum(dim=1) - mismatch_penalty * mismatch.float().sum(dim=1)
 
     active_lift = expected_swing.any(dim=1)
+    double_swing_match = expected_swing.all(dim=1) & actual_swing.all(dim=1)
     return torch.where(
-        active_lift,
+        active_lift & ~double_swing_match,
         score,
         torch.zeros(env.num_envs, device=net_forces.device),
     )

@@ -531,3 +531,32 @@ def diag_joint_pos_rel_without_wheel(
     tensor = joint_pos_rel_without_wheel(env, asset_cfg=asset_cfg, wheel_asset_cfg=wheel_asset_cfg)
     _log_large_obs_term(env, "joint_pos_rel_without_wheel", tensor, threshold=10.0)
     return tensor
+
+
+def contact_state(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Binary contact state centered at zero: +0.5 in contact, -0.5 not in contact."""
+    from isaaclab.sensors import ContactSensor
+
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    return (torch.linalg.norm(net_forces, dim=-1) > threshold).float() - 0.5
+
+
+def joint_kp_factor(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Joint stiffness factor relative to the default stiffness, for critic-only privileged input."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    stiffness = asset.data.joint_stiffness[:, asset_cfg.joint_ids]
+    default_stiffness = asset.data.default_joint_stiffness[:, asset_cfg.joint_ids]
+    return (stiffness / (default_stiffness.abs() + 1.0e-6)).clamp(0.0, 2.0)
+
+
+def joint_kd_factor(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Joint damping factor relative to the default damping, for critic-only privileged input."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    damping = asset.data.joint_damping[:, asset_cfg.joint_ids]
+    default_damping = asset.data.default_joint_damping[:, asset_cfg.joint_ids]
+    return (damping / (default_damping.abs() + 1.0e-6)).clamp(0.0, 2.0)

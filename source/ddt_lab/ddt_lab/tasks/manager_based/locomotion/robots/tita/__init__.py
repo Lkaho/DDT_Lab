@@ -1,11 +1,11 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 import gymnasium as gym
 
-from . import agents, flat_env_cfg, no_base_vel_env_cfg, rough_env_cfg, stair_env_cfg
+from . import agents, flat_env_cfg, stair_env_cfg
 
 ##
 # Register Gym environments.
@@ -13,189 +13,126 @@ from . import agents, flat_env_cfg, no_base_vel_env_cfg, rough_env_cfg, stair_en
 
 POSITIVE_REWARD_ENV_ENTRY_POINT = "ddt_lab.tasks.manager_based.locomotion.positive_reward_env:PositiveRewardManagerBasedRLEnv"
 
-gym.register(
-    id="DDT-Velocity-Flat-Tita-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": flat_env_cfg.TitaFlatEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatPPORunnerCfg",
-    },
-)
 
+# MlpEstimator tasks.
 gym.register(
-    id="DDT-Velocity-Flat-Tita-CENet-v0",
+    id="DDT-Velocity-Flat-Tita-MlpEstimator-v0",
     entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.TitaFlatCENetEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatCENetAdaBootPPORunnerCfg",
+        "env_cfg_entry_point": flat_env_cfg.TitaFlatMlpEstimatorEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatMlpEstimatorPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="DDT-Velocity-Flat-Tita-CENet-Play-v0",
+    id="DDT-Velocity-Flat-Tita-MlpEstimator-Play-v0",
     entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.TitaFlatCENetEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatCENetAdaBootPPORunnerCfg",
+        "env_cfg_entry_point": flat_env_cfg.TitaFlatMlpEstimatorEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatMlpEstimatorPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="DDT-Velocity-Flat-Tita-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": flat_env_cfg.TitaFlatEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="DDT-Velocity-Rough-Tita-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": rough_env_cfg.TitaRoughEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaRoughPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="DDT-Velocity-Rough-Tita-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": rough_env_cfg.TitaRoughEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaRoughPPORunnerCfg",
-    },
-)
-
-
-gym.register(
-    id="DDT-Velocity-Stair-Tita-Estimator-v0",
+    id="DDT-Velocity-Rough-Tita-MlpEstimator-v0",
     entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairEstimatorPPORunnerCfg",
+        "env_cfg_entry_point": flat_env_cfg.TitaRoughMlpEstimatorEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaRoughMlpEstimatorPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="DDT-Velocity-Stair-Tita-Estimator-Play-v0",
+    id="DDT-Velocity-Rough-Tita-MlpEstimator-Play-v0",
     entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairEstimatorPPORunnerCfg",
+        "env_cfg_entry_point": flat_env_cfg.TitaRoughMlpEstimatorEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaRoughMlpEstimatorPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="DDT-Velocity-Stair-Tita-NoEstimator-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairNoEstimatorEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="DDT-Velocity-Stair-Tita-NoEstimator-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairNoEstimatorEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="DDT-Velocity-Stair-Tita-CENet-v0",
+    id="DDT-Velocity-Stair-Tita-MlpEstimator-v0",
     entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairCENetEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairCENetAdaBootPPORunnerCfg",
+        "env_cfg_entry_point": stair_env_cfg.TitaStairMlpEstimatorEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairMlpEstimatorPPORunnerCfg",
     },
 )
 
-
 gym.register(
-    id="DDT-Velocity-Stair-Tita-CENet-Play-v0",
+    id="DDT-Velocity-Stair-Tita-MlpEstimator-Play-v0",
     entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairCENetEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairCENetAdaBootPPORunnerCfg",
+        "env_cfg_entry_point": stair_env_cfg.TitaStairMlpEstimatorEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairMlpEstimatorPPORunnerCfg",
     },
 )
 
 
+# DreamWaQ tasks.
 gym.register(
-    id="DDT-Velocity-Stair-Tita-NoBaseVel-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    id="DDT-Velocity-Flat-Tita-DreamWaQ-v0",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairNoBaseVelEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairPPORunnerCfg",
+        "env_cfg_entry_point": flat_env_cfg.TitaFlatDreamWaQEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatDreamWaQAdaBootPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="DDT-Velocity-Stair-Tita-NoBaseVel-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    id="DDT-Velocity-Flat-Tita-DreamWaQ-Play-v0",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": stair_env_cfg.TitaStairNoBaseVelEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairPPORunnerCfg",
-    },
-)
-
-##
-# Register environments without base_lin_vel_xy observation
-##
-
-gym.register(
-    id="DDT-Velocity-Flat-Tita-NoBaseVel-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": no_base_vel_env_cfg.TitaFlatNoBaseVelEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatNoBaseVelEstimatorPPORunnerCfg",
+        "env_cfg_entry_point": flat_env_cfg.TitaFlatDreamWaQEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatDreamWaQAdaBootPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="DDT-Velocity-Flat-Tita-NoBaseVel-NoEstimator-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    id="DDT-Velocity-Rough-Tita-DreamWaQ-v0",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": no_base_vel_env_cfg.TitaFlatNoBaseVelNoEstimatorEnvCfg,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatNoBaseVelPPORunnerCfg",
+        "env_cfg_entry_point": flat_env_cfg.TitaRoughDreamWaQEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaRoughDreamWaQAdaBootPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="DDT-Velocity-Flat-Tita-NoBaseVel-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    id="DDT-Velocity-Rough-Tita-DreamWaQ-Play-v0",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": no_base_vel_env_cfg.TitaFlatNoBaseVelEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatNoBaseVelEstimatorPPORunnerCfg",
+        "env_cfg_entry_point": flat_env_cfg.TitaRoughDreamWaQEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaRoughDreamWaQAdaBootPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="DDT-Velocity-Flat-Tita-NoBaseVel-NoEstimator-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    id="DDT-Velocity-Stair-Tita-DreamWaQ-v0",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": no_base_vel_env_cfg.TitaFlatNoBaseVelNoEstimatorEnvCfg_PLAY,
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaFlatNoBaseVelPPORunnerCfg",
+        "env_cfg_entry_point": stair_env_cfg.TitaStairDreamWaQEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairDreamWaQAdaBootPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="DDT-Velocity-Stair-Tita-DreamWaQ-Play-v0",
+    entry_point=POSITIVE_REWARD_ENV_ENTRY_POINT,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": stair_env_cfg.TitaStairDreamWaQEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TitaStairDreamWaQAdaBootPPORunnerCfg",
     },
 )

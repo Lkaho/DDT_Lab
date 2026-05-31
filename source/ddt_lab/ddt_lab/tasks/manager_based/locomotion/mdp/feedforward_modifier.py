@@ -26,7 +26,7 @@ class FeedforwardModifier:
         feedforward_period: float = 0.6,
         k_ff: float = 0.3,
         contact_force_threshold: float = 50.0,
-        followup_trigger_delay_factor: float = 0.0,
+        inter_leg_phase_lag: float = 0.0,
     ):
         self._env = env
         self._device = env.device
@@ -65,7 +65,7 @@ class FeedforwardModifier:
         self._ff_period = feedforward_period
         self._k_ff = k_ff
         self._force_threshold = contact_force_threshold
-        self._followup_trigger_delay = followup_trigger_delay_factor * self._ff_period
+        self._inter_leg_phase_lag_time = inter_leg_phase_lag * self._ff_period
 
         self._contact_sensor_name = contact_sensor_name
         self._contact_body_pattern = contact_body_pattern
