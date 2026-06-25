@@ -47,6 +47,24 @@ parser.add_argument(
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--keyboard", action="store_true", default=False, help="Use keyboard to drive base_velocity.")
 parser.add_argument(
+    "--keyboard_command_mode",
+    choices=("hold", "step"),
+    default="hold",
+    help="Keyboard command behavior: hold uses live key state, step increments a persistent base_velocity target.",
+)
+parser.add_argument(
+    "--keyboard_command_lin_step",
+    type=float,
+    default=0.1,
+    help="Linear velocity increment for --keyboard_command_mode step, in m/s.",
+)
+parser.add_argument(
+    "--keyboard_command_yaw_step",
+    type=float,
+    default=0.1,
+    help="Yaw velocity increment for --keyboard_command_mode step, in rad/s.",
+)
+parser.add_argument(
     "--kff",
     type=float,
     default=None,
@@ -402,6 +420,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    env_cfg.sim.use_fabric = not args_cli.disable_fabric
 
     keyboard_interface = None
     keyboard_command_state = {
@@ -412,6 +431,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         "heading_error": None,
         "last_yaw_active": None,
         "yaw_mode": None,
+        "target_command": None,
     }
     if args_cli.keyboard:
         if getattr(args_cli, "headless", False):
@@ -426,7 +446,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         base_velocity_cfg = env_cfg.commands.base_velocity
         base_velocity_cfg.debug_vis = False
         base_velocity_ranges = base_velocity_cfg.ranges
-        keyboard_heading_kp = float(getattr(base_velocity_cfg, "heading_control_stiffness", 1.0))
         keyboard_yaw_min = float(base_velocity_ranges.ang_vel_z[0])
         keyboard_yaw_max = float(base_velocity_ranges.ang_vel_z[1])
         keyboard_yaw_deadband = 1.0e-4
@@ -439,8 +458,91 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
         keyboard_interface = Se2Keyboard(keyboard_cfg)
 
-        def _keyboard_velocity_command(env):
-            raw_command = keyboard_interface.advance().to(env.device)
+        keyboard_step_target = np.zeros(3, dtype=np.float32)
+        keyboard_command_min = np.array(
+            [
+                float(base_velocity_ranges.lin_vel_x[0]),
+                float(base_velocity_ranges.lin_vel_y[0]),
+                float(base_velocity_ranges.ang_vel_z[0]),
+            ],
+            dtype=np.float32,
+        )
+        keyboard_command_max = np.array(
+            [
+                float(base_velocity_ranges.lin_vel_x[1]),
+                float(base_velocity_ranges.lin_vel_y[1]),
+                float(base_velocity_ranges.ang_vel_z[1]),
+            ],
+            dtype=np.float32,
+        )
+
+        def _clamp_keyboard_step_target() -> None:
+            np.clip(keyboard_step_target, keyboard_command_min, keyboard_command_max, out=keyboard_step_target)
+
+        def _adjust_keyboard_step_target(index: int, delta: float) -> None:
+            keyboard_step_target[index] += float(delta)
+            _clamp_keyboard_step_target()
+
+        def _reset_keyboard_step_target() -> None:
+            keyboard_step_target.fill(0.0)
+            keyboard_command_state["desired_heading"] = None
+            keyboard_command_state["last_yaw_active"] = None
+
+        def _sync_keyboard_command_manager(env, command, desired_heading=None, yaw_active=None) -> None:
+            command_manager = getattr(env, "command_manager", None)
+            if command_manager is None or "base_velocity" not in command_manager.active_terms:
+                return
+
+            command_term = command_manager.get_term("base_velocity")
+            if not hasattr(command_term, "vel_command_b"):
+                return
+
+            num_envs = min(command.shape[0], command_term.vel_command_b.shape[0])
+            synced_command = command[:num_envs].to(device=command_term.vel_command_b.device)
+            command_term.vel_command_b[:num_envs].copy_(synced_command)
+
+            if desired_heading is not None and hasattr(command_term, "heading_target"):
+                command_term.heading_target[:num_envs].copy_(
+                    desired_heading[:num_envs].to(device=command_term.heading_target.device)
+                )
+            if yaw_active is not None and hasattr(command_term, "is_heading_env"):
+                command_term.is_heading_env[:num_envs] = False
+            if hasattr(command_term, "is_standing_env"):
+                is_standing = torch.linalg.norm(synced_command, dim=1) <= keyboard_yaw_deadband
+                command_term.is_standing_env[:num_envs].copy_(
+                    is_standing.to(device=command_term.is_standing_env.device)
+                )
+
+        if args_cli.keyboard_command_mode == "step":
+            lin_step = float(args_cli.keyboard_command_lin_step)
+            yaw_step = float(args_cli.keyboard_command_yaw_step)
+            for key in ("UP", "NUMPAD_8"):
+                keyboard_interface.add_callback(
+                    key, lambda axis=0, step=lin_step: _adjust_keyboard_step_target(axis, step)
+                )
+            for key in ("DOWN", "NUMPAD_2"):
+                keyboard_interface.add_callback(
+                    key, lambda axis=0, step=-lin_step: _adjust_keyboard_step_target(axis, step)
+                )
+            for key in ("LEFT", "NUMPAD_4"):
+                keyboard_interface.add_callback(
+                    key, lambda axis=1, step=lin_step: _adjust_keyboard_step_target(axis, step)
+                )
+            for key in ("RIGHT", "NUMPAD_6"):
+                keyboard_interface.add_callback(
+                    key, lambda axis=1, step=-lin_step: _adjust_keyboard_step_target(axis, step)
+                )
+            for key in ("Z", "NUMPAD_7"):
+                keyboard_interface.add_callback(
+                    key, lambda axis=2, step=yaw_step: _adjust_keyboard_step_target(axis, step)
+                )
+            for key in ("X", "NUMPAD_9"):
+                keyboard_interface.add_callback(
+                    key, lambda axis=2, step=-yaw_step: _adjust_keyboard_step_target(axis, step)
+                )
+            keyboard_interface.add_callback("L", _reset_keyboard_step_target)
+
+        def _apply_keyboard_heading_hold(env, raw_command):
             if raw_command.ndim == 1:
                 raw_command = raw_command.unsqueeze(0)
 
@@ -466,27 +568,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             raw_yaw = raw_command[:, 2]
             yaw_active = torch.abs(raw_yaw) > keyboard_yaw_deadband
-            last_yaw_active = keyboard_command_state["last_yaw_active"]
-            if (
-                last_yaw_active is None
-                or last_yaw_active.shape != yaw_active.shape
-                or last_yaw_active.device != yaw_active.device
-            ):
-                last_yaw_active = torch.zeros_like(yaw_active)
-
-            just_released = last_yaw_active & ~yaw_active
-            refresh_mask = yaw_active | just_released
-            if torch.any(refresh_mask):
-                desired_heading[refresh_mask] = current_heading[refresh_mask]
+            if torch.any(yaw_active):
+                desired_heading[yaw_active] = current_heading[yaw_active]
 
             heading_error = math_utils.wrap_to_pi(desired_heading - current_heading)
-            heading_hold_yaw = torch.clamp(
-                keyboard_heading_kp * heading_error,
-                min=keyboard_yaw_min,
-                max=keyboard_yaw_max,
-            )
             direct_yaw = torch.clamp(raw_yaw, min=keyboard_yaw_min, max=keyboard_yaw_max)
-            command[:, 2] = torch.where(yaw_active, direct_yaw, heading_hold_yaw)
+            command[:, 2] = direct_yaw
 
             keyboard_command_state["raw_command"] = raw_command.detach().clone()
             keyboard_command_state["command"] = command.detach().clone()
@@ -494,8 +581,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             keyboard_command_state["current_heading"] = current_heading.detach().clone()
             keyboard_command_state["heading_error"] = heading_error.detach().clone()
             keyboard_command_state["last_yaw_active"] = yaw_active.detach().clone()
-            keyboard_command_state["yaw_mode"] = "direct" if bool(yaw_active[0].item()) else "heading_hold"
+            keyboard_command_state["yaw_mode"] = "direct" if bool(yaw_active[0].item()) else "heading_disabled"
+            if args_cli.keyboard_command_mode == "step":
+                _sync_keyboard_command_manager(env, command, desired_heading=desired_heading, yaw_active=yaw_active)
             return command
+
+        def _keyboard_velocity_command(env):
+            if args_cli.keyboard_command_mode == "step":
+                _clamp_keyboard_step_target()
+                raw_command = torch.tensor(keyboard_step_target, dtype=torch.float32, device=env.device).unsqueeze(0)
+                keyboard_command_state["target_command"] = raw_command.detach().clone()
+                return _apply_keyboard_heading_hold(env, raw_command)
+
+            raw_command = keyboard_interface.advance().to(env.device)
+            keyboard_command_state["target_command"] = None
+            return _apply_keyboard_heading_hold(env, raw_command)
 
         observations_cfg = getattr(env_cfg, "observations", None)
         if observations_cfg is not None:
@@ -613,7 +713,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO] Keyboard teleoperation enabled for policy velocity_commands.")
         print(keyboard_interface)
         print("[INFO] Keyboard mode: disabled observation corruption and domain-randomization events.")
-        print("[INFO] Keyboard mode: using raw Se2Keyboard commands; command manager is left unchanged.")
+        if args_cli.keyboard_command_mode == "step":
+            print("[INFO] Keyboard command mode: step-adjusted persistent base_velocity target.")
+            print(
+                "[INFO] Step keys: UP/NUMPAD_8 vx+, DOWN/NUMPAD_2 vx-, "
+                "LEFT/NUMPAD_4 vy+, RIGHT/NUMPAD_6 vy-, Z/NUMPAD_7 yaw+, X/NUMPAD_9 yaw-, L reset."
+            )
+            print(
+                f"[INFO] Step sizes: linear={args_cli.keyboard_command_lin_step:.3f} m/s, "
+                f"yaw={args_cli.keyboard_command_yaw_step:.3f} rad/s."
+            )
+            print("[INFO] Keyboard mode: syncing step command into command_manager base_velocity.")
+        else:
+            print("[INFO] Keyboard mode: using raw Se2Keyboard commands; command manager is left unchanged.")
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
@@ -833,6 +945,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions = policy(obs_for_policy)
             
             # env stepping
+            if (
+                args_cli.keyboard
+                and args_cli.keyboard_command_mode == "step"
+                and keyboard_command_state["command"] is not None
+            ):
+                _sync_keyboard_command_manager(
+                    env.unwrapped,
+                    keyboard_command_state["command"],
+                    desired_heading=keyboard_command_state.get("desired_heading"),
+                    yaw_active=keyboard_command_state.get("last_yaw_active"),
+                )
             obs, _, _, _ = env.step(actions)
             if keyboard_follow_camera is not None:
                 keyboard_follow_camera.update(env)
@@ -931,6 +1054,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if env.unwrapped.num_envs == 1:
                     if args_cli.keyboard:
                         print("  Keyboard command (policy observation):")
+                        target_keyboard_command = keyboard_command_state.get("target_command")
+                        if target_keyboard_command is not None:
+                            target_cmd = target_keyboard_command[0].detach().cpu().numpy()
+                            print(f"    target cmd:       {target_cmd}")
                         raw_keyboard_command = keyboard_command_state.get("raw_command")
                         if raw_keyboard_command is not None:
                             raw_cmd = raw_keyboard_command[0].detach().cpu().numpy()

@@ -454,6 +454,84 @@ def diag_feet_average_contact_force(
     return tensor
 
 
+def robot_joint_torque(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return applied joint torque for the selected robot joints."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.applied_torque[:, asset_cfg.joint_ids]
+
+
+def robot_joint_acc(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return joint acceleration for the selected robot joints."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.joint_acc[:, asset_cfg.joint_ids]
+
+
+def feet_lin_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return flattened world-frame linear velocity for selected foot bodies."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_lin_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]
+    return body_lin_vel.reshape(body_lin_vel.shape[0], -1)
+
+
+def robot_mass(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return default rigid-body masses for selected robot bodies."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.default_mass[:, asset_cfg.body_ids].to(env.device)
+
+
+def robot_inertia(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return flattened default inertia tensors for selected robot bodies."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    inertia = asset.data.default_inertia[:, asset_cfg.body_ids, :].to(env.device)
+    return inertia.reshape(inertia.shape[0], -1)
+
+
+def robot_joint_pos(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return default joint positions for selected robot joints."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+
+
+def robot_joint_stiffness(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return default joint stiffness for selected robot joints."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.default_joint_stiffness[:, asset_cfg.joint_ids]
+
+
+def robot_joint_damping(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return default joint damping for selected robot joints."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.default_joint_damping[:, asset_cfg.joint_ids]
+
+
+def robot_pos(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return robot root position in world frame."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.root_pos_w
+
+
+def robot_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return robot root velocity in world frame."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.root_vel_w
+
+
+def robot_material_properties(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Return flattened PhysX material properties for all robot collision shapes."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    material_properties = asset.root_physx_view.get_material_properties().to(env.device)
+    return material_properties.reshape(material_properties.shape[0], -1)
+
+
+def feet_contact_force(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Return flattened world-frame contact forces for selected feet."""
+    from isaaclab.sensors import ContactSensor
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    return net_forces.reshape(net_forces.shape[0], -1)
+
+
 def safe_height_scan(env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg, offset: float = 0.5) -> torch.Tensor:
     """Height scan with NaN/Inf sanitization and rate-limited diagnostics.
 

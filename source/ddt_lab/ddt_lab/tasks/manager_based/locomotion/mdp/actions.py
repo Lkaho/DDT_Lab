@@ -12,7 +12,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs.mdp.actions import JointPositionAction
 from isaaclab.envs.mdp.actions import actions_cfg
 from isaaclab.managers.action_manager import ActionTerm, ActionTermCfg
-from isaaclab.utils import configclass
+from isaaclab.utils import DelayBuffer, configclass
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -26,7 +26,17 @@ _FIRST_RIGHT_LEG = 2
 
 def _leg_index_from_name(name: str) -> int:
     """Map a left/right joint or body name to the public [left, right] leg order."""
-    return _RIGHT_LEG_INDEX if "right" in name.lower() else _LEFT_LEG_INDEX
+    return _RIGHT_LEG_INDEX if _is_right_leg_name(name) else _LEFT_LEG_INDEX
+
+
+def _is_left_leg_name(name: str) -> bool:
+    name = name.lower()
+    return "left" in name or name.startswith(("fl_", "rl_"))
+
+
+def _is_right_leg_name(name: str) -> bool:
+    name = name.lower()
+    return "right" in name or name.startswith(("fr_", "rr_"))
 
 
 class JointPositionWithFeedforwardAction(JointPositionAction):
@@ -258,9 +268,9 @@ class JointPositionWithFeedforwardAction(JointPositionAction):
             self._left_foot_id = None
             for i, name in enumerate(self._contact_sensor.body_names):
                 if re.match(self.cfg.contact_body_pattern, name):
-                    if "right" in name.lower():
+                    if _is_right_leg_name(name):
                         self._right_foot_id = i
-                    elif "left" in name.lower():
+                    elif _is_left_leg_name(name):
                         self._left_foot_id = i
             self._contact_force_history = torch.zeros(3, self.num_envs, 2, device=self.device)
 
@@ -488,6 +498,25 @@ class TitaJointPositionEffortAction(ActionTerm):
             index_list, _, value_list = string_utils.resolve_matching_names_values(cfg.clip, self._combined_action_names)
             self._clip[:, index_list] = torch.tensor(value_list, device=self.device)
 
+        self._command_delay_min_steps = int(cfg.command_delay_min_steps)
+        self._command_delay_max_steps = int(cfg.command_delay_max_steps)
+        if self._command_delay_min_steps < 0:
+            raise ValueError("command_delay_min_steps must be non-negative.")
+        if self._command_delay_max_steps < self._command_delay_min_steps:
+            raise ValueError("command_delay_max_steps must be greater than or equal to command_delay_min_steps.")
+        self._command_delay_enabled = self._command_delay_max_steps > 0
+        self._leg_command_delay_lags = torch.zeros(self.num_envs, dtype=torch.int, device=self.device)
+        self._wheel_command_delay_lags = torch.zeros(self.num_envs, dtype=torch.int, device=self.device)
+        self._leg_command_delay_buffer = None
+        self._wheel_command_delay_buffer = None
+        if self._command_delay_enabled:
+            self._leg_command_delay_buffer = DelayBuffer(
+                self._command_delay_max_steps, self.num_envs, device=self.device
+            )
+            self._wheel_command_delay_buffer = DelayBuffer(
+                self._command_delay_max_steps, self.num_envs, device=self.device
+            )
+
         self._ff_enabled = cfg.feedforward_enabled
         self._k_fb = cfg.k_fb
         self._k_ff = cfg.k_ff
@@ -501,6 +530,7 @@ class TitaJointPositionEffortAction(ActionTerm):
         self._k_ff_start_iteration = cfg.k_ff_start_iteration
         self._k_ff_anneal_iterations = cfg.k_ff_anneal_iterations
         self._k_ff_steps_per_iteration = max(1, cfg.k_ff_steps_per_iteration)
+        self._contact_trigger_warmup_steps = max(0, int(cfg.contact_trigger_warmup_steps))
 
         self._ff_amplitude = torch.zeros(self._num_leg_joints, device=self.device)
         if isinstance(cfg.feedforward_amplitude, dict):
@@ -547,6 +577,9 @@ class TitaJointPositionEffortAction(ActionTerm):
         self._last_ff_actions = torch.zeros(self.num_envs, self._num_leg_joints, device=self.device)
         self._last_ff_contribution = torch.zeros(self.num_envs, self._num_leg_joints, device=self.device)
         self._last_blended_actions = torch.zeros(self.num_envs, self._action_dim, device=self.device)
+        self._contact_trigger_warmup_counter = torch.full(
+            (self.num_envs,), self._contact_trigger_warmup_steps, device=self.device, dtype=torch.long
+        )
         self._action_diag_period_steps = 2000
         self._action_diag_max_logs = 50
         self._action_diag_last_step = -self._action_diag_period_steps
@@ -620,6 +653,14 @@ class TitaJointPositionEffortAction(ActionTerm):
         return self._last_blended_actions
 
     @property
+    def leg_command_delay_lags(self) -> torch.Tensor:
+        return self._leg_command_delay_lags
+
+    @property
+    def wheel_command_delay_lags(self) -> torch.Tensor:
+        return self._wheel_command_delay_lags
+
+    @property
     def controlled_joint_ids(self) -> torch.Tensor:
         return torch.as_tensor(self._leg_joint_ids, device=self.device, dtype=torch.long)
 
@@ -646,17 +687,81 @@ class TitaJointPositionEffortAction(ActionTerm):
         current_k_ff = self._initial_k_ff + (self._k_ff_final - self._initial_k_ff) * progress
         self._k_ff = float(current_k_ff)
 
-    def _clear_feedforward_state(self):
-        self._time.zero_()
-        self._lifting_state.zero_()
-        self._first_leg.zero_()
-        self._last_lift_signal.zero_()
-        self._last_ff_signal.zero_()
-        self._last_trigger_signal.zero_()
-        self._last_ff_actions.zero_()
-        self._last_ff_contribution.zero_()
+    def _clear_feedforward_state(self, env_ids: torch.Tensor | slice | None = None):
+        if env_ids is None:
+            self._time.zero_()
+            self._lifting_state.zero_()
+            self._first_leg.zero_()
+            self._last_lift_signal.zero_()
+            self._last_ff_signal.zero_()
+            self._last_trigger_signal.zero_()
+            self._last_ff_actions.zero_()
+            self._last_ff_contribution.zero_()
+        else:
+            self._time[env_ids] = 0.0
+            self._lifting_state[env_ids] = False
+            self._first_leg[env_ids] = 0
+            self._last_lift_signal[env_ids] = 0.0
+            self._last_ff_signal[env_ids] = 0.0
+            self._last_trigger_signal[env_ids] = False
+            self._last_ff_actions[env_ids] = 0.0
+            self._last_ff_contribution[env_ids] = 0.0
         if hasattr(self, "_contact_force_history"):
-            self._contact_force_history.zero_()
+            if env_ids is None:
+                self._contact_force_history.zero_()
+            else:
+                self._contact_force_history[:, env_ids] = 0.0
+
+    def _num_env_ids(self, env_ids: torch.Tensor | slice | Sequence[int] | None) -> int:
+        if env_ids is None:
+            return self.num_envs
+        if isinstance(env_ids, slice):
+            return len(range(*env_ids.indices(self.num_envs)))
+        if isinstance(env_ids, torch.Tensor):
+            return int(env_ids.numel())
+        return len(env_ids)
+
+    def _reset_command_delay(self, env_ids: torch.Tensor | slice | None):
+        if env_ids is None:
+            env_ids = slice(None)
+        if not self._command_delay_enabled:
+            self._leg_command_delay_lags[env_ids] = 0
+            self._wheel_command_delay_lags[env_ids] = 0
+            return
+
+        num_envs = self._num_env_ids(env_ids)
+        leg_lags = torch.randint(
+            low=self._command_delay_min_steps,
+            high=self._command_delay_max_steps + 1,
+            size=(num_envs,),
+            dtype=torch.int,
+            device=self.device,
+        )
+        wheel_lags = torch.randint(
+            low=self._command_delay_min_steps,
+            high=self._command_delay_max_steps + 1,
+            size=(num_envs,),
+            dtype=torch.int,
+            device=self.device,
+        )
+        self._leg_command_delay_lags[env_ids] = leg_lags
+        self._wheel_command_delay_lags[env_ids] = wheel_lags
+        self._leg_command_delay_buffer.set_time_lag(leg_lags, env_ids)
+        self._wheel_command_delay_buffer.set_time_lag(wheel_lags, env_ids)
+        self._leg_command_delay_buffer.reset(env_ids)
+        self._wheel_command_delay_buffer.reset(env_ids)
+
+    def _delayed_commands(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self._command_delay_enabled:
+            return self._leg_processed_actions, self._wheel_command_actions, self._wheel_effort_actions
+
+        leg_position_targets = self._leg_command_delay_buffer.compute(self._leg_processed_actions)
+        wheel_targets = self._wheel_command_delay_buffer.compute(
+            torch.cat((self._wheel_command_actions, self._wheel_effort_actions), dim=1)
+        )
+        wheel_velocity_targets = wheel_targets[:, : self._num_wheel_joints]
+        wheel_effort_targets = wheel_targets[:, self._num_wheel_joints :]
+        return leg_position_targets, wheel_velocity_targets, wheel_effort_targets
 
     def _log_action_diagnostics(
         self,
@@ -770,9 +875,10 @@ class TitaJointPositionEffortAction(ActionTerm):
         self._log_action_diagnostics(ff_actions, policy_offset, ff_term, policy_term)
 
     def apply_actions(self):
-        self._asset.set_joint_position_target(self._leg_processed_actions, joint_ids=self._leg_joint_ids)
-        self._asset.set_joint_velocity_target(self._wheel_command_actions, joint_ids=self._wheel_joint_ids)
-        self._asset.set_joint_effort_target(self._wheel_effort_actions, joint_ids=self._wheel_joint_ids)
+        leg_position_targets, wheel_velocity_targets, wheel_effort_targets = self._delayed_commands()
+        self._asset.set_joint_position_target(leg_position_targets, joint_ids=self._leg_joint_ids)
+        self._asset.set_joint_velocity_target(wheel_velocity_targets, joint_ids=self._wheel_joint_ids)
+        self._asset.set_joint_effort_target(wheel_effort_targets, joint_ids=self._wheel_joint_ids)
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         if env_ids is None:
@@ -793,6 +899,8 @@ class TitaJointPositionEffortAction(ActionTerm):
         self._last_ff_actions[env_ids] = 0.0
         self._last_ff_contribution[env_ids] = 0.0
         self._last_blended_actions[env_ids] = 0.0
+        self._contact_trigger_warmup_counter[env_ids] = self._contact_trigger_warmup_steps
+        self._reset_command_delay(env_ids)
         if hasattr(self, "_contact_force_history"):
             self._contact_force_history[:, env_ids] = 0.0
 
@@ -805,11 +913,20 @@ class TitaJointPositionEffortAction(ActionTerm):
             self._left_foot_id = None
             for i, name in enumerate(self._contact_sensor.body_names):
                 if re.match(self.cfg.contact_body_pattern, name):
-                    if "right" in name.lower():
+                    if _is_right_leg_name(name):
                         self._right_foot_id = i
-                    elif "left" in name.lower():
+                    elif _is_left_leg_name(name):
                         self._left_foot_id = i
             self._contact_force_history = torch.zeros(3, self.num_envs, 2, device=self.device)
+
+        warmup_mask = self._contact_trigger_warmup_counter > 0
+        if torch.any(warmup_mask):
+            self._clear_feedforward_state(warmup_mask)
+            self._contact_trigger_warmup_counter[warmup_mask] -= 1
+
+        active_mask = ~warmup_mask
+        if not torch.any(active_mask):
+            return torch.zeros(self.num_envs, 2, device=self.device)
 
         forces_xyz = self._contact_sensor.data.net_forces_w
         left_xy = torch.zeros(self.num_envs, device=self.device)
@@ -822,8 +939,8 @@ class TitaJointPositionEffortAction(ActionTerm):
             right_xy = torch.sqrt(right_force[:, 0] ** 2 + right_force[:, 1] ** 2)
 
         feet_xy = torch.stack([left_xy, right_xy], dim=1)
-        self._contact_force_history[:-1] = self._contact_force_history[1:].clone()
-        self._contact_force_history[-1] = feet_xy
+        self._contact_force_history[:-1, active_mask] = self._contact_force_history[1:, active_mask].clone()
+        self._contact_force_history[-1, active_mask] = feet_xy[active_mask]
 
         avg_force = self._contact_force_history.mean(dim=0)
         left_contact = avg_force[:, _LEFT_LEG_INDEX] > self._force_threshold
@@ -1022,6 +1139,8 @@ class TitaJointPositionEffortActionCfg(ActionTermCfg):
     preserve_order: bool = False
     use_default_leg_offset: bool = True
     clip: dict[str, tuple[float, float]] | None = None
+    command_delay_min_steps: int = 0
+    command_delay_max_steps: int = 0
 
     feedforward_enabled: bool = False
     k_fb: float = 1.0
@@ -1033,12 +1152,18 @@ class TitaJointPositionEffortActionCfg(ActionTermCfg):
     contact_sensor_name: str = "contact_forces"
     contact_body_pattern: str = ".*_leg_4"
     contact_force_threshold: float = 10.0
+    contact_trigger_warmup_steps: int = 0
     inter_leg_phase_lag: float = 0.0
     k_ff_anneal_enabled: bool = False
     k_ff_final: float = 0.0
     k_ff_start_iteration: int = 0
     k_ff_anneal_iterations: int = 0
     k_ff_steps_per_iteration: int = 24
+
+
+@configclass
+class D1HJointPositionEffortActionCfg(TitaJointPositionEffortActionCfg):
+    """Configuration alias for D1H leg-position and wheel velocity-plus-feedforward action."""
 
 
 @configclass

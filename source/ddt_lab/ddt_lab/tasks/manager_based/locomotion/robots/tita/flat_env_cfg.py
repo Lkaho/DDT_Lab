@@ -13,12 +13,13 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import ddt_lab.tasks.manager_based.locomotion.mdp as mdp
 
-from .rough_env_cfg import TitaRoughEnvCfg, configure_forward_only_play_commands
+from .rough_env_cfg import TitaFeedforwardActionsCfg, TitaRoughEnvCfg, configure_forward_only_play_commands
 
-ESTIMATOR_TARGET_BASE_LIN_VEL_XY_SCALE = [1.0, 1.0]
-ESTIMATOR_POLICY_BASE_LIN_VEL_XY_SCALE = [2.0, 2.0]
+ESTIMATOR_TARGET_BASE_LIN_VEL_SCALE = [1.0, 1.0, 1.0]
+ESTIMATOR_POLICY_BASE_LIN_VEL_SCALE = [2.0, 2.0, 2.0]
 ESTIMATOR_HISTORY_LENGTH = 3
 ESTIMATOR_FEATURE_HISTORY_LENGTH = 10
+DREAMWAQ_HISTORY_LENGTH = 10
 
 
 FLAT_DREAMWAQ_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
@@ -113,6 +114,46 @@ class MlpEstimatorObservationsCfg:
             scale=1.0,
         )
 
+        robot_joint_torque = ObsTerm(
+            func=mdp.robot_joint_torque,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        robot_joint_acc = ObsTerm(
+            func=mdp.robot_joint_acc,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        feet_lin_vel = ObsTerm(
+            func=mdp.feet_lin_vel,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=[".*_leg_4"])},
+        )
+        robot_mass = ObsTerm(
+            func=mdp.robot_mass,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=".*")},
+        )
+        robot_inertia = ObsTerm(
+            func=mdp.robot_inertia,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=".*")},
+        )
+        robot_joint_pos = ObsTerm(
+            func=mdp.robot_joint_pos,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        robot_joint_stiffness = ObsTerm(
+            func=mdp.robot_joint_stiffness,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        robot_joint_damping = ObsTerm(
+            func=mdp.robot_joint_damping,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+     
+        robot_vel = ObsTerm(func=mdp.robot_vel)
+        robot_material_properties = ObsTerm(func=mdp.robot_material_properties)
+        feet_contact_force = ObsTerm(
+            func=mdp.feet_contact_force,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"])},
+        )
+
         def __post_init__(self) -> None:
             self.history_length = 1
 
@@ -146,7 +187,7 @@ class MlpEstimatorObservationsCfg:
 
     @configclass
     class VelocityTargetCfg(ObsGroup):
-        base_lin_vel_xy = ObsTerm(func=mdp.base_lin_vel_xy, scale=1.0)
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
@@ -176,7 +217,7 @@ class DreamWaQObservationsCfg:
     class DreamWaQProprioHistoryCfg(PolicyCfg):
         def __post_init__(self) -> None:
             super().__post_init__()
-            self.history_length = 5
+            self.history_length = DREAMWAQ_HISTORY_LENGTH
 
     @configclass
     class CriticCfg(MlpEstimatorObservationsCfg.CriticCfg):
@@ -240,6 +281,7 @@ class TitaRoughMlpEstimatorEnvCfg_PLAY(TitaRoughMlpEstimatorEnvCfg):
 class TitaFlatMlpEstimatorEnvCfg(TitaRoughEnvCfg):
     """Tita flat terrain environment with history-based base velocity estimation."""
 
+    actions: TitaFeedforwardActionsCfg = TitaFeedforwardActionsCfg()
     observations: MlpEstimatorObservationsCfg = MlpEstimatorObservationsCfg()
 
     def __post_init__(self):
@@ -264,19 +306,27 @@ class TitaFlatMlpEstimatorEnvCfg(TitaRoughEnvCfg):
             weight=-1.0,
             params={
                 "command_name": "base_velocity",
-                "command_threshold": 0.15,
+                "command_threshold": 0.1,
                 "asset_cfg": SceneEntityCfg("robot", joint_names=["joint_.*_leg_[123]"]),
             },
         )
-        self.rewards.zero_command_wheel_vel = RewTerm(
-            func=mdp.zero_command_wheel_vel_l1,
-            weight=-0.1,
+        self.rewards.zero_command_base_motion = RewTerm(
+            func=mdp.zero_command_base_motion_l1,
+            weight=-0.2,
             params={
-                "command_name": "base_velocity",
-                "command_threshold": 0.15,
-                "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+                "lin_threshold": 0.05,
+                "ang_threshold": 0.05,
             },
         )
+        # self.rewards.zero_command_wheel_vel = RewTerm(
+        #     func=mdp.zero_command_wheel_vel_l1,
+        #     weight=-1.0,
+        #     params={
+        #         "command_name": "base_velocity",
+        #         "command_threshold": 0.15,
+        #         "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+        #     },
+        # )
         self.rewards.opposite_wheel_vel = RewTerm(
             func=mdp.opposite_wheel_vel,
             weight=-1.0,
@@ -337,6 +387,7 @@ class TitaRoughDreamWaQEnvCfg_PLAY(TitaRoughDreamWaQEnvCfg):
 class TitaFlatDreamWaQEnvCfg(TitaRoughEnvCfg):
     """Tita flat/rough-flat environment with DreamWaQ context estimation."""
 
+    actions: TitaFeedforwardActionsCfg = TitaFeedforwardActionsCfg()
     observations: DreamWaQObservationsCfg = DreamWaQObservationsCfg()
 
     def __post_init__(self):
@@ -346,10 +397,10 @@ class TitaFlatDreamWaQEnvCfg(TitaRoughEnvCfg):
         self.scene.terrain.terrain_generator = FLAT_DREAMWAQ_TERRAINS_CFG
         self.scene.terrain.max_init_terrain_level = 1
 
-        self.only_positive_rewards = True
+        self.only_positive_rewards = False
         self.rewards.flat_orientation_l2.weight = -12.0
-        self.rewards.base_height_l2.weight = -5.0
-        self.rewards.joint_deviation_legs_l1.weight = -0.5
+        self.rewards.base_height_l2.weight = -20.0
+        self.rewards.joint_deviation_legs_l1.weight = -0.1
         self.rewards.undesired_contacts.weight = -5.0
 
 

@@ -17,7 +17,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 import ddt_lab.tasks.manager_based.locomotion.mdp as mdp
 
 from .rough_env_cfg import CommandsCfg as RoughCommandsCfg
-from .rough_env_cfg import EventCfg, RewardsCfg, TitaRoughEnvCfg, configure_forward_only_play_commands
+from .rough_env_cfg import EventCfg, RewardsCfg, TitaFeedforwardActionsCfg, TitaRoughEnvCfg, configure_forward_only_play_commands
 from .rough_env_cfg import TerminationsCfg as RoughTerminationsCfg
 
 
@@ -107,18 +107,17 @@ STAIR_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
         "discrete_obstacles": terrain_gen.MeshRandomGridTerrainCfg(
             proportion=0.20,
             grid_width=0.45,
-            grid_height_range=(0.02, 0.10),
+            grid_height_range=(0.0, 0.10),
             platform_width=2.0,
         ),
         "stairs_down": MeshInvertedPyramidStairsWidthCurriculumCfg(
-            proportion=0.50,
-            step_height_range=(0.08, 0.15),
+            proportion=0.60,
+            step_height_range=(0.0, 0.15),
             step_width_range=(0.5, 0.3),
             platform_width=2.5,
             border_width=0.0,
             holes=False,
         ),
-        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.10),
     },
 )
 
@@ -217,6 +216,7 @@ STAIR_ESTIMATOR_POLICY_HISTORY_LENGTH = 10
 STAIR_ESTIMATOR_WINDOW_LENGTH = 3
 STAIR_ESTIMATOR_OUTPUT_HISTORY_LENGTH = STAIR_ESTIMATOR_POLICY_HISTORY_LENGTH
 STAIR_ESTIMATOR_HISTORY_TERM_DIMS = (3, 3, 3, 6, 8, 8)
+STAIR_DREAMWAQ_HISTORY_LENGTH = 10
 
 
 @configclass
@@ -329,7 +329,7 @@ class StairMlpEstimatorObservationsCfg:
     class VelocityTargetCfg(ObsGroup):
         """Velocity supervision target for the estimator."""
 
-        base_lin_vel_xy = ObsTerm(func=mdp.base_lin_vel_xy, scale=1.0)
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -357,11 +357,49 @@ class StairDreamWaQObservationsCfg:
     class DreamWaQProprioHistoryCfg(PolicyCfg):
         def __post_init__(self):
             super().__post_init__()
-            self.history_length = 5
+            self.history_length = STAIR_DREAMWAQ_HISTORY_LENGTH
 
     @configclass
     class CriticCfg(StairMlpEstimatorObservationsCfg.CriticCfg):
-        pass
+        robot_joint_torque = ObsTerm(
+            func=mdp.robot_joint_torque,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        robot_joint_acc = ObsTerm(
+            func=mdp.robot_joint_acc,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        feet_lin_vel = ObsTerm(
+            func=mdp.feet_lin_vel,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=[".*_leg_4"])},
+        )
+        robot_mass = ObsTerm(
+            func=mdp.robot_mass,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=".*")},
+        )
+        robot_inertia = ObsTerm(
+            func=mdp.robot_inertia,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=".*")},
+        )
+        robot_joint_pos = ObsTerm(
+            func=mdp.robot_joint_pos,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        robot_joint_stiffness = ObsTerm(
+            func=mdp.robot_joint_stiffness,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        robot_joint_damping = ObsTerm(
+            func=mdp.robot_joint_damping,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
+        )
+        robot_pos = ObsTerm(func=mdp.robot_pos)
+        robot_vel = ObsTerm(func=mdp.robot_vel)
+        robot_material_properties = ObsTerm(func=mdp.robot_material_properties)
+        feet_contact_force = ObsTerm(
+            func=mdp.feet_contact_force,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"])},
+        )
 
     @configclass
     class PrivCfg(StairMlpEstimatorObservationsCfg.PrivCfg):
@@ -386,52 +424,9 @@ class StairDreamWaQObservationsCfg:
 
 
 @configclass
-class StairActionsCfg:
+class StairActionsCfg(TitaFeedforwardActionsCfg):
     """Action specification with contact-triggered feedforward trajectory."""
-
-    joint_pos = mdp.TitaJointPositionEffortActionCfg(
-        asset_name="robot",
-        leg_joint_names=[
-            "joint_left_leg_1",
-            "joint_left_leg_2",
-            "joint_left_leg_3",
-            "joint_right_leg_1",
-            "joint_right_leg_2",
-            "joint_right_leg_3",
-        ],
-        wheel_joint_names=["joint_left_leg_4", "joint_right_leg_4"],
-        leg_scale=(0.25, 0.25, 0.25, 0.25, 0.25, 0.25),
-        wheel_scale=5.0,
-        wheel_effort_gain=0.0,
-        wheel_offset=0.0,
-        use_default_leg_offset=True,
-        preserve_order=True,
-        clip={".*": (-100.0, 100.0)},
-        feedforward_enabled=True,
-        k_fb=1.0,
-        k_ff=0.5,
-        feedforward_period=0.6,
-        feedforward_amplitude={
-            ".*_leg_2": 0.4,
-            ".*_leg_3": -0.80,
-        },
-        feedforward_joint_names=[
-            "joint_left_leg_2",
-            "joint_left_leg_3",
-            "joint_right_leg_2",
-            "joint_right_leg_3",
-        ],
-        contact_trigger_enabled=True,
-        contact_sensor_name="contact_forces",
-        contact_body_pattern=".*_leg_4",
-        contact_force_threshold=50.0,
-        inter_leg_phase_lag=0.5,
-        k_ff_anneal_enabled=True,
-        k_ff_final=0.0,
-        k_ff_start_iteration=20000,
-        k_ff_anneal_iterations=10000,
-        k_ff_steps_per_iteration=24,
-    )
+    pass
 
 
 @configclass
@@ -454,7 +449,7 @@ class StairCommandsCfg(RoughCommandsCfg):
         debug_vis=True,
         restricted_sub_terrain_names=("stairs_up", "stairs_down"),
         restricted_lin_vel_x_range=(0.0, 1.0),
-        restricted_heading_range=(-math.pi / 4.0, math.pi / 4.0),
+        restricted_heading_range=None,
         force_zero_lin_vel_y=True,
         force_zero_ang_vel_z=False,
         disable_heading_command=False,
@@ -493,7 +488,7 @@ class StairRewardsCfg(RewardsCfg):
 
     track_heading_exp = RewTerm(
         func=mdp.track_heading_exp,
-        weight=1.0,
+        weight=3.0,
         params={
             "command_name": "base_velocity",
             "std": math.sqrt(0.25),
@@ -502,7 +497,7 @@ class StairRewardsCfg(RewardsCfg):
 
     stand_still = RewTerm(
         func=mdp.stand_still,
-        weight=-0.5,
+        weight=-1.0,
         params={
             "command_name": "base_velocity",
             "command_threshold": 0.1,
@@ -512,7 +507,7 @@ class StairRewardsCfg(RewardsCfg):
 
     feet_air_time = RewTerm(
         func=mdp.feet_air_time,
-        weight=1.0,
+        weight=0.0,
         params={
             "command_name": "base_velocity",
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
@@ -549,19 +544,19 @@ class StairRewardsCfg(RewardsCfg):
         },
     )
 
-    feet_swing_xy_impact = RewTerm(
-        func=mdp.feet_swing_xy_impact_penalty,
-        weight=-0.002,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
-            "action_name": "joint_pos",
-            "xy_force_threshold": 50.0,
-        },
-    )
+    # feet_swing_xy_impact = RewTerm(
+    #     func=mdp.feet_swing_xy_impact_penalty,
+    #     weight=-0.002,
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
+    #         "action_name": "joint_pos",
+    #         "xy_force_threshold": 50.0,
+    #     },
+    # )
 
     tracking_target_pos = RewTerm(
         func=mdp.track_ff_target_pos_exp,
-        weight= 0.8,
+        weight=1.0,
         params={
             "action_name": "joint_pos",
             "asset_cfg": SceneEntityCfg("robot"),
@@ -573,16 +568,16 @@ class StairRewardsCfg(RewardsCfg):
     # Style rewards
     # ---------------------------------------------------------------------
 
-    joint_mirror = RewTerm(
-        func=mdp.stair_joint_mirror,
-        weight=-1.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "mirror_joints": [["joint_left_leg_(1|2|3)", "joint_right_leg_(1|2|3)"]],
-            "action_name": "joint_pos",
-        },
-    )
-    # joint_mirror = None
+    # joint_mirror = RewTerm(
+    #     func=mdp.stair_joint_mirror,
+    #     weight=-1.0,
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot"),
+    #         "mirror_joints": [["joint_left_leg_(1|2|3)", "joint_right_leg_(1|2|3)"]],
+    #         "action_name": "joint_pos",
+    #     },
+    # )
+    joint_mirror = None
 
     joint_deviation_leg1_l1 = RewTerm(
         func=mdp.joint_deviation_l1,
@@ -591,20 +586,21 @@ class StairRewardsCfg(RewardsCfg):
     )
 
     wheel_vel_penalty = RewTerm(
-        func=mdp.wheel_vel_penalty,
-        weight=-0.01,
+        func=mdp.wheel_zero_velocity_exp,
+        weight=0.5,
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_leg_4"]),
-            "command_name": "base_velocity",
-            "velocity_threshold": 100.0,
-            "command_threshold": 0.1,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["joint_left_leg_4", "joint_right_leg_4"],
+                preserve_order=True,
+            ),
+            "action_name": "joint_pos",
         },
     )
 
     wheel_spin = RewTerm(
         func=mdp.wheel_spin_penalty,
-        weight=-0.5,
+        weight=-5.0,
         params={
             "wheel_joint_cfg": SceneEntityCfg(
                 "robot", joint_names=["joint_left_leg_4", "joint_right_leg_4"]
@@ -628,13 +624,13 @@ class StairRewardsCfg(RewardsCfg):
 
     base_height_l2 = RewTerm(
         func=mdp.base_height_l2,
-        weight=-20.0,
-        params={"target_height": 0.35, "sensor_cfg": SceneEntityCfg("height_scanner")},
+        weight=-30.0,
+        params={"target_height": 0.38, "sensor_cfg": SceneEntityCfg("height_scanner")},
     )
 
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-12.0)
 
-    upward = RewTerm(func=mdp.upward, weight= 1.0)
+    upward = RewTerm(func=mdp.upward, weight= 0.5)
 
     # ---------------------------------------------------------------------
     # Regularization rewards
@@ -651,16 +647,14 @@ class StairRewardsCfg(RewardsCfg):
         },
     )
 
-    zero_command_wheel_vel = RewTerm(
-        func=mdp.zero_command_wheel_vel_l1,
-        weight=-0.5,
+    zero_command_base_motion = RewTerm(
+        func=mdp.zero_command_base_motion_l1,
+        weight=-1.0,
         params={
-            "command_name": "base_velocity",
-            "command_threshold": 0.15,
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
+            "lin_threshold": 0.05,
+            "ang_threshold": 0.05,
         },
     )
-
     opposite_base_vel = RewTerm(
         func=mdp.opposite_base_vel,
         weight=-40.0,
@@ -669,7 +663,7 @@ class StairRewardsCfg(RewardsCfg):
 
     opposite_wheel_vel = RewTerm(
         func=mdp.opposite_wheel_vel,
-        weight=-2.0,
+        weight=-1.5,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_leg_4"]),
@@ -692,11 +686,9 @@ class StairCurriculumCfg:
         func=mdp.terrain_levels_by_type,
         params={
             "terrain_names": [
-                "random_rough",
                 "smooth_slope",
                 "discrete_obstacles",
                 "stairs_down",
-                "flat",
             ],
         },
     )
@@ -738,7 +730,7 @@ class TitaStairBaseEnvCfg(TitaRoughEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (-math.pi / 4.0, math.pi / 4.0)
         self.commands.base_velocity.restricted_lin_vel_x_range = (0.0, 1.0)
-        self.commands.base_velocity.restricted_heading_range = (-math.pi / 4.0, math.pi / 4.0)
+        self.commands.base_velocity.restricted_heading_range = None
 
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.2, 0.2), "y": (-0.2, 0.2), "yaw": (-math.pi / 4.0, math.pi / 4.0)},
@@ -777,10 +769,10 @@ class TitaStairDreamWaQEnvCfg(TitaStairBaseEnvCfg):
         super().__post_init__()
 
         self.only_positive_rewards = False
-        self.rewards.base_height_l2.weight = -12.0
-        self.rewards.flat_orientation_l2.weight = -20.0
-        self.rewards.opposite_base_vel.weight = -10.0
-        self.rewards.opposite_wheel_vel.weight = -1.0
+        self.rewards.base_height_l2.weight = -30.0
+        self.rewards.flat_orientation_l2.weight = -12.0
+        self.rewards.opposite_base_vel.weight = -40.0
+        self.rewards.opposite_wheel_vel.weight = -1.5
         self.rewards.feet_y_distance.weight = -2.0
 
 

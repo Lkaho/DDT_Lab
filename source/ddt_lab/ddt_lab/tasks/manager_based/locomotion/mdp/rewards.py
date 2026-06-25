@@ -115,13 +115,12 @@ def joint_power(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityC
 
 def stand_still(
     env: ManagerBasedRLEnv,
-    command_name: str,
+    command_name: str = "base_velocity",
     command_threshold: float = 0.06,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     actual_velocity_threshold: float | None = None,
 ) -> torch.Tensor:
-    """Penalize offsets from the default joint positions when the command is very small."""
-    # Penalize motion when command is nearly zero.
+    """Penalize offsets from default joint positions when the command is very small."""
     reward = mdp.joint_deviation_l1(env, asset_cfg)
     reward *= _zero_command_mask(
         env,
@@ -152,6 +151,12 @@ def _zero_command_mask(
 
 def _upright_scale(env: ManagerBasedRLEnv) -> torch.Tensor:
     return torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+
+def upright(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Reward the asset for staying upright."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return torch.clamp(-asset.data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
 
 
 def zero_command_base_ang_vel_z_l2(
@@ -194,6 +199,29 @@ def zero_command_base_lin_vel_xy_l2(
     )
     reward *= _upright_scale(env)
     return reward
+
+
+def zero_command_base_motion_l1(
+    env: ManagerBasedRLEnv,
+    lin_threshold: float = 0.05,
+    ang_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize world-frame base motion when commanded velocities are near zero."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    base_lin_vel = asset.data.root_lin_vel_w[:, :2]
+    base_ang_vel = asset.data.root_ang_vel_w[:, -1]
+
+    commands = env.command_manager.get_command("base_velocity")
+    lin_commands = commands[:, :2]
+    ang_commands = commands[:, 2]
+
+    reward_lin = torch.sum(
+        torch.abs(base_lin_vel) * (torch.norm(lin_commands, dim=1, keepdim=True) < lin_threshold),
+        dim=-1,
+    )
+    reward_ang = torch.abs(base_ang_vel) * (torch.abs(ang_commands) < ang_threshold)
+    return reward_lin + reward_ang
 
 
 def zero_command_wheel_vel_l1(
@@ -355,6 +383,42 @@ def joint_deviation_l2_no_lift(
     return reward
 
 
+def wheel_zero_velocity_exp(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    action_name: str = "joint_pos",
+) -> torch.Tensor:
+    """Reward zero wheel velocity for wheels in the triggered swing phase."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    wheel_mask = _get_lifting_state(env, action_name=action_name)
+    if wheel_mask.shape[1] < wheel_vel.shape[1]:
+        raise ValueError(
+            "wheel_zero_velocity_exp expected lifting_state to have at least as many columns as wheel joints. "
+            f"Got lifting_state shape {tuple(wheel_mask.shape)} and wheel_vel shape {tuple(wheel_vel.shape)}."
+        )
+    wheel_mask = wheel_mask[:, : wheel_vel.shape[1]]
+    return torch.exp(-torch.sum(wheel_mask.float() * torch.square(wheel_vel), dim=1))
+
+
+def wheel_swing_velocity_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    action_name: str = "joint_pos",
+) -> torch.Tensor:
+    """Penalize wheel velocity for wheels in the triggered swing phase."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    wheel_mask = _get_lifting_state(env, action_name=action_name)
+    if wheel_mask.shape[1] < wheel_vel.shape[1]:
+        raise ValueError(
+            "wheel_swing_velocity_l2 expected lifting_state to have at least as many columns as wheel joints. "
+            f"Got lifting_state shape {tuple(wheel_mask.shape)} and wheel_vel shape {tuple(wheel_vel.shape)}."
+        )
+    wheel_mask = wheel_mask[:, : wheel_vel.shape[1]]
+    return torch.sum(wheel_mask.float() * torch.square(wheel_vel), dim=1)
+
+
 def wheel_vel_penalty(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
@@ -395,6 +459,18 @@ def wheel_spin_penalty(
     foot_speed = torch.linalg.norm(foot_asset.data.body_lin_vel_w[:, foot_body_cfg.body_ids, :2], dim=2)
     slip = torch.clamp(spin_scale * wheel_surface_speed - foot_speed - slip_deadband, min=0.0)
     return torch.sum(slip, dim=1)
+
+
+def wheel_body_speed_mismatch_l1(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    wheel_radius: float = 0.0925,
+) -> torch.Tensor:
+    """Penalize mismatch between signed wheel surface speed and base-frame forward speed."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_speed = asset.data.root_lin_vel_b[:, 0]
+    wheel_speed = wheel_radius * torch.mean(asset.data.joint_vel[:, asset_cfg.joint_ids], dim=1)
+    return torch.abs(wheel_speed - body_speed)
 
 
 class GaitReward(ManagerTermBase):
@@ -1062,8 +1138,16 @@ def _left_right_contact_force_local_ids(contact_sensor: ContactSensor, sensor_cf
         selected_body_ids = [int(body_id) for body_id in body_ids]
 
     selected_names = [contact_sensor.body_names[body_id] for body_id in selected_body_ids]
-    left_ids = [i for i, name in enumerate(selected_names) if "left" in name.lower()]
-    right_ids = [i for i, name in enumerate(selected_names) if "right" in name.lower()]
+    left_ids = [
+        i
+        for i, name in enumerate(selected_names)
+        if "left" in name.lower() or name.lower().startswith(("fl_", "l_"))
+    ]
+    right_ids = [
+        i
+        for i, name in enumerate(selected_names)
+        if "right" in name.lower() or name.lower().startswith(("fr_", "r_"))
+    ]
     if len(left_ids) != 1 or len(right_ids) != 1:
         raise ValueError(
             "Expected exactly one left and one right contact body for phase matching, "
@@ -1422,3 +1506,28 @@ def feet_y_distance(
     penalty_min = torch.clamp(min_distance - y_dist, min=0.0)
     penalty_max = torch.clamp(y_dist - max_distance, min=0.0)
     return penalty_min + penalty_max
+
+
+def feet_y_distance_exp(
+    env: ManagerBasedRLEnv,
+    target_distance: float,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward stance width matching the target y distance with an exponential kernel."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    feet_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    if feet_pos_w.shape[1] != 2:
+        raise ValueError(f"feet_y_distance_exp expected exactly 2 foot bodies, got {feet_pos_w.shape[1]}.")
+
+    base_pos_w = asset.data.root_pos_w
+    base_quat_w = asset.data.root_quat_w
+    feet_pos_rel = feet_pos_w - base_pos_w.unsqueeze(1)
+    feet_pos_b = torch.zeros_like(feet_pos_rel)
+    for i in range(feet_pos_rel.shape[1]):
+        feet_pos_b[:, i, :] = quat_apply_inverse(base_quat_w, feet_pos_rel[:, i, :])
+
+    y_dist = torch.abs(feet_pos_b[:, 0, 1] - feet_pos_b[:, 1, 1])
+    reward = torch.exp(-torch.square(y_dist - target_distance) / (std**2))
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward

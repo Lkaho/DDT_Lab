@@ -11,15 +11,17 @@ from isaaclab_rl.rsl_rl import (
 )
 
 from ..stair_env_cfg import (
+    STAIR_DREAMWAQ_HISTORY_LENGTH,
     STAIR_ESTIMATOR_HISTORY_TERM_DIMS,
     STAIR_ESTIMATOR_OUTPUT_HISTORY_LENGTH,
     STAIR_ESTIMATOR_WINDOW_LENGTH,
 )
 from ..flat_env_cfg import (
+    DREAMWAQ_HISTORY_LENGTH as FLAT_ROUGH_DREAMWAQ_HISTORY_LENGTH,
     ESTIMATOR_FEATURE_HISTORY_LENGTH,
     ESTIMATOR_HISTORY_LENGTH,
-    ESTIMATOR_POLICY_BASE_LIN_VEL_XY_SCALE,
-    ESTIMATOR_TARGET_BASE_LIN_VEL_XY_SCALE,
+    ESTIMATOR_POLICY_BASE_LIN_VEL_SCALE,
+    ESTIMATOR_TARGET_BASE_LIN_VEL_SCALE,
 )
 
 TITA_COST_NAMES = ["joint_pos_limit", "joint_vel_limit", "joint_torque_limit"]
@@ -84,8 +86,9 @@ def _enable_velocity_estimator(
     experiment_name: str,
     num_history: int = ESTIMATOR_HISTORY_LENGTH,
     estimated_history_length: int = ESTIMATOR_HISTORY_LENGTH,
-    estimator_target_scale: list[float] | tuple[float, ...] = ESTIMATOR_TARGET_BASE_LIN_VEL_XY_SCALE,
-    estimator_feature_scale: list[float] | tuple[float, ...] = ESTIMATOR_POLICY_BASE_LIN_VEL_XY_SCALE,
+    estimator_output_dim: int = 3,
+    estimator_target_scale: list[float] | tuple[float, ...] = ESTIMATOR_TARGET_BASE_LIN_VEL_SCALE,
+    estimator_feature_scale: list[float] | tuple[float, ...] = ESTIMATOR_POLICY_BASE_LIN_VEL_SCALE,
 ) -> None:
     runner_cfg.experiment_name = experiment_name
     runner_cfg.policy.class_name = "ActorCriticWithEstimator"
@@ -93,7 +96,7 @@ def _enable_velocity_estimator(
     runner_cfg.policy.estimator_hidden_dims = [256, 128]
     runner_cfg.policy.num_history = num_history
     runner_cfg.policy.estimated_history_length = estimated_history_length
-    runner_cfg.policy.estimator_output_dim = 2
+    runner_cfg.policy.estimator_output_dim = estimator_output_dim
     runner_cfg.policy.estimator_target_scale = estimator_target_scale
     runner_cfg.policy.estimator_feature_scale = estimator_feature_scale
     runner_cfg.algorithm.estimator_loss_coef = 1.0
@@ -190,7 +193,7 @@ class TitaStairDreamWaQAdaBootPPORunnerCfg(TitaRoughPPORunnerCfg):
         self.policy.cenet_decoder_hidden_dims = [64, 128]
         self.policy.cenet_velocity_dim = 3
         self.policy.cenet_latent_dim = 16
-        self.policy.num_history = 5
+        self.policy.num_history = STAIR_DREAMWAQ_HISTORY_LENGTH
         self.algorithm.cenet_loss_coef = 1.0
         self.algorithm.cenet_velocity_loss_coef = 1.0
         self.algorithm.cenet_reconstruction_loss_coef = 1.0
@@ -215,6 +218,7 @@ class TitaFlatDreamWaQAdaBootPPORunnerCfg(TitaStairDreamWaQAdaBootPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
         self.experiment_name = "tita_flat_dreamwaq_adaboot"
+        self.policy.num_history = FLAT_ROUGH_DREAMWAQ_HISTORY_LENGTH
 
 
 @configclass
@@ -223,3 +227,4 @@ class TitaRoughDreamWaQAdaBootPPORunnerCfg(TitaStairDreamWaQAdaBootPPORunnerCfg)
         super().__post_init__()
         self.max_iterations = 5000
         self.experiment_name = "tita_rough_dreamwaq_adaboot"
+        self.policy.num_history = FLAT_ROUGH_DREAMWAQ_HISTORY_LENGTH
